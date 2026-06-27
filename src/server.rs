@@ -612,7 +612,15 @@ fn execute_operation(state: AppState, operation: Operation) -> Response {
 }
 
 fn execute_native_request(state: &AppState, frame: RequestFrame) -> ResponseFrame {
-    let payload = match frame.payload {
+    ResponseFrame {
+        request_id: frame.request_id,
+        command: frame.command,
+        payload: execute_native_payload(state, frame.payload),
+    }
+}
+
+fn execute_native_payload(state: &AppState, payload: RequestPayload) -> ResponsePayload {
+    match payload {
         RequestPayload::Get { namespace, key } => {
             state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
             match state
@@ -784,12 +792,6 @@ fn execute_native_request(state: &AppState, frame: RequestFrame) -> ResponseFram
                 }
             }
         }
-    };
-
-    ResponseFrame {
-        request_id: frame.request_id,
-        command: frame.command,
-        payload,
     }
 }
 
@@ -1441,6 +1443,104 @@ mod tests {
         ));
 
         task.abort();
+    }
+
+    #[test]
+    fn native_execution_uses_decoded_payloads_without_http_request_accounting() {
+        let state = AppState::from_config(&Config::default());
+
+        let stored = execute_native_payload(
+            &state,
+            RequestPayload::Put {
+                namespace: "default".to_string(),
+                key: b"direct-key".to_vec(),
+                metadata: Metadata {
+                    tags: vec!["direct-tag".to_string()],
+                    ..Metadata::default()
+                },
+                value: b"direct-value".to_vec(),
+            },
+        );
+        assert_eq!(stored, ResponsePayload::Stored { evicted: 0 });
+
+        let hit = execute_native_payload(
+            &state,
+            RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"direct-key".to_vec(),
+            },
+        );
+        assert_eq!(hit, ResponsePayload::Hit(b"direct-value".to_vec()));
+
+        let batch = execute_native_payload(
+            &state,
+            RequestPayload::BatchGet {
+                namespace: "default".to_string(),
+                keys: vec![b"direct-key".to_vec(), b"missing".to_vec()],
+            },
+        );
+        assert_eq!(
+            batch,
+            ResponsePayload::BatchGet {
+                items: vec![BatchItem::Hit(b"direct-value".to_vec()), BatchItem::Miss]
+            }
+        );
+
+        let invalidated = execute_native_payload(
+            &state,
+            RequestPayload::TagInvalidate {
+                namespace: "default".to_string(),
+                tag: "direct-tag".to_string(),
+            },
+        );
+        assert_eq!(invalidated, ResponsePayload::Invalidated { removed: 1 });
+
+        let lease = execute_native_payload(
+            &state,
+            RequestPayload::LeaseStart {
+                namespace: "default".to_string(),
+                key: b"lease-direct".to_vec(),
+                lease_ttl_ms: 60_000,
+                allow_stale_ms: None,
+            },
+        );
+        let token = match lease {
+            ResponsePayload::LeaseGranted { lease_token, .. } => lease_token,
+            other => panic!("expected native lease grant, got {other:?}"),
+        };
+
+        let complete = execute_native_payload(
+            &state,
+            RequestPayload::LeaseComplete {
+                namespace: "default".to_string(),
+                key: b"lease-direct".to_vec(),
+                lease_token: token,
+                metadata: Metadata::default(),
+                value: b"lease-value".to_vec(),
+            },
+        );
+        assert_eq!(complete, ResponsePayload::Stored { evicted: 0 });
+
+        let lease_hit = execute_native_payload(
+            &state,
+            RequestPayload::LeaseStart {
+                namespace: "default".to_string(),
+                key: b"lease-direct".to_vec(),
+                lease_ttl_ms: 60_000,
+                allow_stale_ms: None,
+            },
+        );
+        assert_eq!(lease_hit, ResponsePayload::Hit(b"lease-value".to_vec()));
+
+        let snapshot = state.metrics.snapshot();
+        assert_eq!(snapshot.requests_total, 0);
+        assert_eq!(snapshot.put_requests, 1);
+        assert_eq!(snapshot.get_requests, 1);
+        assert_eq!(snapshot.batch_get_requests, 1);
+        assert_eq!(snapshot.tag_invalidate_requests, 1);
+        assert_eq!(snapshot.hits_total, 3);
+        assert_eq!(snapshot.misses_total, 1);
+        assert_eq!(snapshot.lease_grants, 1);
     }
 
     #[tokio::test]
