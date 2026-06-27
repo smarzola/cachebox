@@ -1,4 +1,6 @@
 use std::net::TcpListener as StdTcpListener;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +16,8 @@ use cachebox::server;
 use http::Request;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
 
 const WARMUP_ITERS: usize = 100;
@@ -41,7 +45,7 @@ macro_rules! measure_async {
 }
 
 macro_rules! measure_native_async {
-    ($name:expr, $notes:expr, $body:block) => {{
+    ($client:expr, $name:expr, $notes:expr, $body:block) => {{
         let mut samples = Vec::new();
         let started = Instant::now();
         while started.elapsed() < MEASURE_DURATION {
@@ -49,7 +53,14 @@ macro_rules! measure_native_async {
             $body
             samples.push(sample_started.elapsed());
         }
-        summarize($name, "loopback_tcp", $notes, samples, started.elapsed(), 0)
+        summarize(
+            $name,
+            $client.transport,
+            $notes,
+            samples,
+            started.elapsed(),
+            0,
+        )
     }};
 }
 
@@ -68,9 +79,9 @@ async fn async_main() {
     let native_server = NativeLoopbackServer::start(Config::default());
     let mut client = H2Client::connect(&server.addr).await;
     let mut eviction_client = H2Client::connect(&eviction_server.addr).await;
-    let mut native_client = NativeClient::connect(&native_server.addr).await;
+    let mut native_client = NativeClient::connect_tcp(&native_server.addr).await;
 
-    let scenarios = [
+    let mut scenarios = vec![
         bench_engine_get(),
         bench_engine_put(),
         bench_engine_tag_invalidate_8(),
@@ -93,6 +104,23 @@ async fn async_main() {
         bench_native_tag_invalidation(&mut native_client).await,
         bench_native_ttl_heavy_writes(&mut native_client).await,
     ];
+
+    #[cfg(unix)]
+    {
+        let native_unix_server = NativeUnixLoopbackServer::start(Config::default());
+        let mut native_unix_client = NativeClient::connect_unix(&native_unix_server.path).await;
+        scenarios.extend([
+            bench_native_single_key_get(&mut native_unix_client).await,
+            bench_native_single_key_put(&mut native_unix_client).await,
+            bench_native_batch_get(&mut native_unix_client).await,
+            bench_native_lease_contention(&mut native_unix_client).await,
+            bench_native_tag_invalidate_empty(&mut native_unix_client).await,
+            bench_native_tag_invalidate_8(&mut native_unix_client).await,
+            bench_native_tag_invalidation(&mut native_unix_client).await,
+            bench_native_ttl_heavy_writes(&mut native_unix_client).await,
+        ]);
+        native_unix_server.cleanup();
+    }
 
     println!(
         "scenario transport iterations p50_ns p95_ns p99_ns throughput_ops_s memory_used_bytes cost_score_total notes"
@@ -429,7 +457,7 @@ async fn bench_native_single_key_get(client: &mut NativeClient) -> BenchResult {
             ResponsePayload::Hit(b"value".to_vec())
         );
     });
-    measure_native_async!("single_key_get", "cached_hit", {
+    measure_native_async!(client, "single_key_get", "cached_hit", {
         assert_eq!(
             client
                 .request(Command::Get, native_get_payload(b"get-key"))
@@ -454,7 +482,7 @@ async fn bench_native_single_key_put(client: &mut NativeClient) -> BenchResult {
             ResponsePayload::Stored { evicted: 0 }
         );
     });
-    measure_native_async!("single_key_put", "unique_keys", {
+    measure_native_async!(client, "single_key_put", "unique_keys", {
         let key = format!("native-put-{index}");
         index += 1;
         assert_eq!(
@@ -488,7 +516,7 @@ async fn bench_native_batch_get(client: &mut NativeClient) -> BenchResult {
     warmup_async!({
         assert_native_batch_hits(client, &keys).await;
     });
-    measure_native_async!("batch_get_32", "32_keys", {
+    measure_native_async!(client, "batch_get_32", "32_keys", {
         assert_native_batch_hits(client, &keys).await;
     })
 }
@@ -524,7 +552,7 @@ async fn bench_native_lease_contention(client: &mut NativeClient) -> BenchResult
             ResponsePayload::LeaseDenied
         );
     });
-    measure_native_async!("lease_contention", "same_missing_key", {
+    measure_native_async!(client, "lease_contention", "same_missing_key", {
         assert_eq!(
             client
                 .request(
@@ -554,7 +582,7 @@ async fn bench_native_tag_invalidate_empty(client: &mut NativeClient) -> BenchRe
             ResponsePayload::Invalidated { removed: 0 }
         );
     });
-    measure_native_async!("tag_invalidate_empty", "single_empty_invalidate", {
+    measure_native_async!(client, "tag_invalidate_empty", "single_empty_invalidate", {
         assert_eq!(
             client
                 .request(
@@ -586,7 +614,7 @@ async fn bench_native_tag_invalidate_8(client: &mut NativeClient) -> BenchResult
     let measured_elapsed = total_duration(&samples);
     summarize(
         "tag_invalidate_8",
-        "loopback_tcp",
+        client.transport,
         "single_invalidate_8_tagged_keys",
         samples,
         measured_elapsed,
@@ -600,10 +628,15 @@ async fn bench_native_tag_invalidation(client: &mut NativeClient) -> BenchResult
         native_tag_invalidation_round(client, index).await;
         index += 1;
     });
-    measure_native_async!("tag_workflow_put8_invalidate", "8_puts_plus_invalidate", {
-        native_tag_invalidation_round(client, index).await;
-        index += 1;
-    })
+    measure_native_async!(
+        client,
+        "tag_workflow_put8_invalidate",
+        "8_puts_plus_invalidate",
+        {
+            native_tag_invalidation_round(client, index).await;
+            index += 1;
+        }
+    )
 }
 
 async fn bench_native_ttl_heavy_writes(client: &mut NativeClient) -> BenchResult {
@@ -621,7 +654,7 @@ async fn bench_native_ttl_heavy_writes(client: &mut NativeClient) -> BenchResult
             ResponsePayload::Stored { evicted: 0 }
         );
     });
-    measure_native_async!("ttl_heavy_writes", "ttl_and_stale_ttl", {
+    measure_native_async!(client, "ttl_heavy_writes", "ttl_and_stale_ttl", {
         let key = format!("native-ttl-{index}");
         index += 1;
         assert_eq!(
@@ -947,19 +980,71 @@ impl NativeLoopbackServer {
     }
 }
 
+#[cfg(unix)]
+struct NativeUnixLoopbackServer {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl NativeUnixLoopbackServer {
+    fn start(config: Config) -> Self {
+        let path = native_unix_socket_path("bench");
+        let listener = tokio::net::UnixListener::bind(&path).expect("native unix listener");
+        let server_path = path.clone();
+
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_io()
+                .build()
+                .expect("native unix tokio runtime");
+            runtime.block_on(async move {
+                server::serve_native_unix(listener, &config)
+                    .await
+                    .expect("native unix loopback server");
+            });
+        });
+
+        Self { path: server_path }
+    }
+
+    fn cleanup(self) {
+        let _ = std::fs::remove_file(self.path);
+    }
+}
+
+#[cfg(unix)]
+fn native_unix_socket_path(name: &str) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "cachebox-{name}-{}-{unique}.sock",
+        std::process::id()
+    ))
+}
+
 struct NativeClient {
-    stream: TcpStream,
+    stream: NativeClientStream,
+    transport: &'static str,
     next_request_id: u64,
 }
 
+enum NativeClientStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
 impl NativeClient {
-    async fn connect(addr: &str) -> Self {
+    async fn connect_tcp(addr: &str) -> Self {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match TcpStream::connect(addr).await {
                 Ok(stream) => {
                     return Self {
-                        stream,
+                        stream: NativeClientStream::Tcp(stream),
+                        transport: "loopback_tcp",
                         next_request_id: 1,
                     };
                 }
@@ -967,6 +1052,26 @@ impl NativeClient {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 Err(error) => panic!("benchmark native client did not connect: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn connect_unix(path: &Path) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match UnixStream::connect(path).await {
+                Ok(stream) => {
+                    return Self {
+                        stream: NativeClientStream::Unix(stream),
+                        transport: "loopback_unix",
+                        next_request_id: 1,
+                    };
+                }
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("benchmark native unix client did not connect: {error}"),
             }
         }
     }
@@ -979,32 +1084,41 @@ impl NativeClient {
             command,
             payload,
         };
-        self.stream
-            .write_all(&encode_request_frame(&frame))
-            .await
-            .expect("native write");
+        self.write_all(&encode_request_frame(&frame)).await;
 
         let mut header = [0u8; HEADER_LEN];
-        self.stream
-            .read_exact(&mut header)
-            .await
-            .expect("native response header");
+        self.read_exact(&mut header).await;
         let payload_len =
             u32::from_be_bytes(header[16..20].try_into().expect("header payload length")) as usize;
         let mut response = Vec::with_capacity(HEADER_LEN + payload_len);
         response.extend_from_slice(&header);
         let start = response.len();
         response.resize(HEADER_LEN + payload_len, 0);
-        self.stream
-            .read_exact(&mut response[start..])
-            .await
-            .expect("native response payload");
+        self.read_exact(&mut response[start..]).await;
 
         let response =
             decode_response_frame(&response, usize::MAX).expect("native response should decode");
         assert_eq!(response.request_id, request_id);
         assert_eq!(response.command, command);
         response.payload
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) {
+        match &mut self.stream {
+            NativeClientStream::Tcp(stream) => stream.write_all(bytes).await,
+            #[cfg(unix)]
+            NativeClientStream::Unix(stream) => stream.write_all(bytes).await,
+        }
+        .expect("native write");
+    }
+
+    async fn read_exact(&mut self, bytes: &mut [u8]) {
+        match &mut self.stream {
+            NativeClientStream::Tcp(stream) => stream.read_exact(bytes).await,
+            #[cfg(unix)]
+            NativeClientStream::Unix(stream) => stream.read_exact(bytes).await,
+        }
+        .expect("native read");
     }
 }
 

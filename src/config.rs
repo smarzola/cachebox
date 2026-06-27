@@ -1,5 +1,6 @@
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7400";
 const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -12,6 +13,7 @@ const DEFAULT_CLEANUP_MAX_ENTRIES_PER_TICK: usize = 128;
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub native_bind_addr: Option<SocketAddr>,
+    pub native_unix_socket: Option<PathBuf>,
     pub max_body_bytes: usize,
     pub max_memory_bytes: usize,
     pub max_value_bytes: usize,
@@ -26,6 +28,7 @@ impl Default for Config {
                 .parse()
                 .expect("default bind address must be valid"),
             native_bind_addr: None,
+            native_unix_socket: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
@@ -42,6 +45,7 @@ pub enum ConfigError {
     UnknownArgument { argument: String },
     InvalidBindAddress { value: String },
     InvalidNativeBindAddress { value: String },
+    InvalidNativeUnixSocket { value: String },
     InvalidMaxBodyBytes { value: String },
     InvalidMaxMemoryBytes { value: String },
     InvalidMaxValueBytes { value: String },
@@ -60,6 +64,9 @@ impl fmt::Display for ConfigError {
             }
             Self::InvalidNativeBindAddress { value } => {
                 write!(f, "invalid native bind address: {value}")
+            }
+            Self::InvalidNativeUnixSocket { value } => {
+                write!(f, "invalid native Unix socket path: {value}")
             }
             Self::InvalidMaxBodyBytes { value } => {
                 write!(f, "invalid max body byte limit: {value}")
@@ -115,6 +122,15 @@ impl Config {
                                     value: value.clone(),
                                 })?,
                         );
+                }
+                "--native-unix" => {
+                    let value = args.next().ok_or_else(|| ConfigError::MissingValue {
+                        flag: argument.clone(),
+                    })?;
+                    if value.is_empty() {
+                        return Err(ConfigError::InvalidNativeUnixSocket { value });
+                    }
+                    config.native_unix_socket = Some(PathBuf::from(value));
                 }
                 "--max-body-bytes" => {
                     config.max_body_bytes = parse_nonzero_usize(&argument, args.next(), |value| {
@@ -184,7 +200,7 @@ pub fn help_text(program_name: &str) -> String {
 Cachebox cache server
 
 Usage:
-  {program_name} [--bind <addr:port>] [--native-bind <addr:port>] [--max-body-bytes <bytes>] [--max-memory-bytes <bytes>] [--max-value-bytes <bytes>] [--cleanup-interval-ms <ms>] [--cleanup-max-entries-per-tick <count>]
+  {program_name} [--bind <addr:port>] [--native-bind <addr:port>] [--native-unix <path>] [--max-body-bytes <bytes>] [--max-memory-bytes <bytes>] [--max-value-bytes <bytes>] [--cleanup-interval-ms <ms>] [--cleanup-max-entries-per-tick <count>]
   {program_name} --help
 
 Options:
@@ -193,6 +209,9 @@ Options:
   --native-bind <addr:port>
                       Address for the native TCP data-plane listener.
                       Disabled unless provided.
+  --native-unix <path>
+                      Path for the native Unix socket data-plane listener.
+                      Disabled unless provided. Unix platforms only.
   --max-body-bytes    Maximum accepted request body size.
                       Default: {DEFAULT_MAX_BODY_BYTES}
   --max-memory-bytes  Maximum estimated in-memory cache size.
@@ -221,6 +240,7 @@ mod tests {
 
         assert_eq!(config.bind_addr.to_string(), DEFAULT_BIND_ADDR);
         assert_eq!(config.native_bind_addr, None);
+        assert_eq!(config.native_unix_socket, None);
         assert_eq!(config.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
         assert_eq!(config.max_memory_bytes, DEFAULT_MAX_MEMORY_BYTES);
         assert_eq!(config.max_value_bytes, DEFAULT_MAX_VALUE_BYTES);
@@ -233,14 +253,24 @@ mod tests {
 
     #[test]
     fn parses_bind_address() {
-        let config =
-            Config::from_args(["--bind", "0.0.0.0:9000", "--native-bind", "127.0.0.1:9001"])
-                .expect("custom config");
+        let config = Config::from_args([
+            "--bind",
+            "0.0.0.0:9000",
+            "--native-bind",
+            "127.0.0.1:9001",
+            "--native-unix",
+            "/tmp/cachebox.sock",
+        ])
+        .expect("custom config");
 
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:9000");
         assert_eq!(
             config.native_bind_addr.map(|addr| addr.to_string()),
             Some("127.0.0.1:9001".to_string())
+        );
+        assert_eq!(
+            config.native_unix_socket,
+            Some(PathBuf::from("/tmp/cachebox.sock"))
         );
     }
 
@@ -273,6 +303,15 @@ mod tests {
             native_error,
             ConfigError::InvalidNativeBindAddress {
                 value: "nope".to_string()
+            }
+        );
+
+        let native_unix_error =
+            Config::from_args(["--native-unix", ""]).expect_err("invalid socket path");
+        assert_eq!(
+            native_unix_error,
+            ConfigError::InvalidNativeUnixSocket {
+                value: String::new()
             }
         );
     }

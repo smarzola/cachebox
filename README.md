@@ -134,6 +134,7 @@ User-facing docs:
 - [Documentation index](docs/README.md)
 - [Quickstart](docs/quickstart.md)
 - [Usage guide](docs/usage.md)
+- [Native sockets](docs/native-sockets.md)
 - [AI helpers](docs/ai-helpers.md)
 - [Benchmarks](docs/benchmarks.md)
 

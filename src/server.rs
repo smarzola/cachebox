@@ -1,6 +1,10 @@
 //! HTTP server startup and handlers.
 
+use std::io;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,8 +16,10 @@ use axum::http::{Method as HttpMethod, StatusCode as HttpStatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::any};
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
@@ -34,6 +40,7 @@ use crate::protocol::{
 pub struct StartupReport {
     pub bind_addr: String,
     pub native_bind_addr: Option<String>,
+    pub native_unix_socket: Option<String>,
     pub max_body_bytes: usize,
     pub max_memory_bytes: usize,
     pub max_value_bytes: usize,
@@ -119,6 +126,10 @@ pub fn startup_report(config: &Config) -> StartupReport {
     StartupReport {
         bind_addr: config.bind_addr.to_string(),
         native_bind_addr: config.native_bind_addr.map(|addr| addr.to_string()),
+        native_unix_socket: config
+            .native_unix_socket
+            .as_ref()
+            .map(|path| path.display().to_string()),
         max_body_bytes: config.max_body_bytes,
         max_memory_bytes: config.max_memory_bytes,
         max_value_bytes: config.max_value_bytes,
@@ -140,6 +151,16 @@ pub async fn serve_native_tcp(listener: TcpListener, config: &Config) -> std::io
     .await
 }
 
+#[cfg(unix)]
+pub async fn serve_native_unix(listener: UnixListener, config: &Config) -> std::io::Result<()> {
+    run_native_unix_listener(
+        listener,
+        AppState::from_config(config),
+        config.max_body_bytes,
+    )
+    .await
+}
+
 fn app_with_state(state: AppState) -> Router {
     Router::new()
         .fallback(any(handle_request))
@@ -150,10 +171,15 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     let local_addr = listener.local_addr()?;
     println!(
-        "event=server_start bind_addr={local_addr} native_bind_addr={} max_body_bytes={} max_memory_bytes={} max_value_bytes={} cleanup_interval_ms={} cleanup_max_entries_per_tick={}",
+        "event=server_start bind_addr={local_addr} native_bind_addr={} native_unix_socket={} max_body_bytes={} max_memory_bytes={} max_value_bytes={} cleanup_interval_ms={} cleanup_max_entries_per_tick={}",
         config
             .native_bind_addr
             .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
+        config
+            .native_unix_socket
+            .as_ref()
+            .map(|path| path.display().to_string())
             .unwrap_or_else(|| "disabled".to_string()),
         config.max_body_bytes,
         config.max_memory_bytes,
@@ -162,6 +188,14 @@ pub async fn run(config: Config) -> std::io::Result<()> {
         config.cleanup_max_entries_per_tick
     );
 
+    #[cfg(not(unix))]
+    if config.native_unix_socket.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native Unix sockets are only supported on Unix platforms",
+        ));
+    }
+
     let state = AppState::from_config(&config);
     let native_listener = match config.native_bind_addr {
         Some(addr) => Some(TcpListener::bind(addr).await?),
@@ -169,6 +203,21 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     };
     let native_task = native_listener.map(|listener| {
         tokio::spawn(run_native_tcp_listener(
+            listener,
+            state.clone(),
+            config.max_body_bytes,
+        ))
+    });
+    #[cfg(unix)]
+    let native_unix_socket = config.native_unix_socket.clone();
+    #[cfg(unix)]
+    let native_unix_listener = match native_unix_socket.as_deref() {
+        Some(path) => Some(bind_native_unix_listener(path).await?),
+        None => None,
+    };
+    #[cfg(unix)]
+    let native_unix_task = native_unix_listener.map(|listener| {
+        tokio::spawn(run_native_unix_listener(
             listener,
             state.clone(),
             config.max_body_bytes,
@@ -189,6 +238,14 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     }
     if let Some(native_task) = native_task {
         native_task.abort();
+    }
+    #[cfg(unix)]
+    if let Some(native_unix_task) = native_unix_task {
+        native_unix_task.abort();
+    }
+    #[cfg(unix)]
+    if let Some(path) = native_unix_socket {
+        let _ = std::fs::remove_file(path);
     }
 
     result
@@ -230,16 +287,63 @@ async fn run_native_tcp_listener(
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
         tokio::spawn(async move {
-            let _ = handle_native_tcp_connection(stream, state, max_payload_len).await;
+            let _ = handle_native_connection(stream, state, max_payload_len).await;
         });
     }
 }
 
-async fn handle_native_tcp_connection(
-    mut stream: TcpStream,
+#[cfg(unix)]
+async fn run_native_unix_listener(
+    listener: UnixListener,
     state: AppState,
     max_payload_len: usize,
 ) -> std::io::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _ = handle_native_connection(stream, state, max_payload_len).await;
+        });
+    }
+}
+
+#[cfg(unix)]
+async fn bind_native_unix_listener(path: &Path) -> std::io::Result<UnixListener> {
+    if path.exists() {
+        match UnixStream::connect(path).await {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("native Unix socket is already active: {}", path.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                let metadata = std::fs::metadata(path)?;
+                if !metadata.file_type().is_socket() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "native Unix socket path is not a socket: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                std::fs::remove_file(path)?;
+            }
+        }
+    }
+    UnixListener::bind(path)
+}
+
+async fn handle_native_connection<S>(
+    mut stream: S,
+    state: AppState,
+    max_payload_len: usize,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         let mut header = [0; HEADER_LEN];
         match stream.read_exact(&mut header).await {
@@ -1013,9 +1117,12 @@ fn _assert_socket_addr(_: SocketAddr) {}
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use tokio::net::TcpStream;
     use tower::ServiceExt;
 
     use super::*;
@@ -1047,10 +1154,36 @@ mod tests {
         (stream, task)
     }
 
-    async fn native_roundtrip(
-        stream: &mut TcpStream,
-        request: NativeRequestFrame,
-    ) -> NativeResponseFrame {
+    #[cfg(unix)]
+    fn native_unix_test_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cachebox-{name}-{}-{unique}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    async fn native_unix_test_client() -> (UnixStream, JoinHandle<std::io::Result<()>>, PathBuf) {
+        let state = AppState::from_config(&Config::default());
+        let path = native_unix_test_path("native-unix");
+        let listener = bind_native_unix_listener(&path)
+            .await
+            .expect("native unix test listener");
+        let task = tokio::spawn(run_native_unix_listener(listener, state, 8192));
+        let stream = UnixStream::connect(&path)
+            .await
+            .expect("native unix test connection");
+        (stream, task, path)
+    }
+
+    async fn native_roundtrip<S>(stream: &mut S, request: NativeRequestFrame) -> NativeResponseFrame
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         stream
             .write_all(&encode_request_frame(&request))
             .await
@@ -1394,6 +1527,61 @@ mod tests {
         assert_eq!(hit.payload, ResponsePayload::Hit(b"fresh".to_vec()));
 
         task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_unix_socket_supports_cache_workflow() {
+        let (mut stream, task, path) = native_unix_test_client().await;
+
+        let put = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 1,
+                command: Command::Put,
+                payload: RequestPayload::Put {
+                    namespace: "default".to_string(),
+                    key: b"unix-key".to_vec(),
+                    metadata: Metadata::default(),
+                    value: b"unix-value".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(put.payload, ResponsePayload::Stored { evicted: 0 });
+
+        let get = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 2,
+                command: Command::Get,
+                payload: RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"unix-key".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(get.payload, ResponsePayload::Hit(b"unix-value".to_vec()));
+
+        task.abort();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_unix_bind_removes_stale_socket_file() {
+        let path = native_unix_test_path("stale");
+        let stale_listener = UnixListener::bind(&path).expect("stale listener bind");
+        drop(stale_listener);
+        assert!(path.exists());
+
+        let listener = bind_native_unix_listener(&path)
+            .await
+            .expect("stale socket file should be replaced");
+        drop(listener);
+        assert!(path.exists());
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

@@ -17,6 +17,8 @@ Useful startup options:
 ```sh
 cargo run --bin cachebox -- \
   --bind 127.0.0.1:7400 \
+  --native-bind 127.0.0.1:7401 \
+  --native-unix /tmp/cachebox.sock \
   --max-body-bytes 8388608 \
   --max-memory-bytes 67108864 \
   --max-value-bytes 8388608 \
@@ -29,6 +31,9 @@ Show all options:
 ```sh
 cargo run --bin cachebox -- --help
 ```
+
+See [Native Sockets](native-sockets.md) for native TCP and Unix socket startup
+commands and a Rust client example.
 
 ## Store A Value
 

@@ -16,6 +16,10 @@ async fn main() -> ExitCode {
                 "native_bind_addr={}",
                 report.native_bind_addr.as_deref().unwrap_or("disabled")
             );
+            println!(
+                "native_unix_socket={}",
+                report.native_unix_socket.as_deref().unwrap_or("disabled")
+            );
             println!("max_body_bytes={}", report.max_body_bytes);
             println!("max_memory_bytes={}", report.max_memory_bytes);
             println!("max_value_bytes={}", report.max_value_bytes);
