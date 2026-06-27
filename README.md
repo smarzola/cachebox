@@ -7,7 +7,7 @@ related entries with tags, keeps memory bounded, and exposes Prometheus-style
 metrics.
 
 The project is written in Rust and runs as a single binary. The current server
-accepts HTTP/2 cleartext and HTTP/1.1 for local tooling.
+accepts HTTP/2 cleartext.
 
 ## Design Principles
 
@@ -63,7 +63,7 @@ cargo run --bin cachebox -- --bind 127.0.0.1:7400
 Store a value:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT 'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123' \
   -H 'Cachebox-TTL: 300s' \
   -H 'Cachebox-Tags: user:123,org:9' \
@@ -75,21 +75,21 @@ curl --http1.1 -i \
 Read it:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123'
 ```
 
 Delete it:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X DELETE 'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123'
 ```
 
 Check metrics:
 
 ```sh
-curl --http1.1 'http://127.0.0.1:7400/metrics'
+curl --http2-prior-knowledge 'http://127.0.0.1:7400/metrics'
 ```
 
 More examples are in [docs/quickstart.md](docs/quickstart.md) and

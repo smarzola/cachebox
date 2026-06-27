@@ -1,7 +1,7 @@
 # Usage Guide
 
 Cachebox stores raw-byte values under percent-encoded byte keys scoped by an
-ASCII namespace. The API accepts HTTP/2 cleartext and HTTP/1.1 for local tools.
+ASCII namespace. The API accepts HTTP/2 cleartext.
 
 All examples use:
 
@@ -18,7 +18,7 @@ Keys are path segments and must be percent-encoded when they contain reserved or
 non-printable bytes:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT "$BASE/v1/namespaces/$NS/keys/user%3A123%2Fprofile" \
   --data-binary 'profile bytes'
 ```
@@ -32,7 +32,7 @@ user:123/profile
 ## Put
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT "$BASE/v1/namespaces/$NS/keys/dashboard%3A42" \
   -H 'Content-Type: application/octet-stream' \
   --data-binary @dashboard.bin
@@ -43,7 +43,7 @@ curl --http1.1 -i \
 ## Get
 
 ```sh
-curl --http1.1 -i "$BASE/v1/namespaces/$NS/keys/dashboard%3A42"
+curl --http2-prior-knowledge -i "$BASE/v1/namespaces/$NS/keys/dashboard%3A42"
 ```
 
 Outcomes:
@@ -61,7 +61,7 @@ Miss response:
 ## Delete
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X DELETE "$BASE/v1/namespaces/$NS/keys/dashboard%3A42"
 ```
 
@@ -72,7 +72,7 @@ Delete is idempotent and returns `204 No Content`.
 Use `Cachebox-TTL` to set the fresh lifetime:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT "$BASE/v1/namespaces/$NS/keys/session%3Aabc" \
   -H 'Cachebox-TTL: 30s' \
   --data-binary 'session bytes'
@@ -100,7 +100,7 @@ Use `Cachebox-Stale-TTL` with `Cachebox-TTL` to keep serving an expired fresh
 value during a stale window:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT "$BASE/v1/namespaces/$NS/keys/report%3Aweekly" \
   -H 'Cachebox-TTL: 60s' \
   -H 'Cachebox-Stale-TTL: 5m' \
@@ -120,7 +120,7 @@ After the stale TTL expires, the key is treated as a miss.
 Batch get reads multiple percent-encoded keys from a JSON control body:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X POST "$BASE/v1/namespaces/$NS/batch/get" \
   -H 'Content-Type: application/json' \
   --data '{"keys":["a","user%3A123","bin%00%FF"]}'
@@ -140,7 +140,7 @@ Example:
 Tags are comma-separated ASCII labels attached on write:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT "$BASE/v1/namespaces/$NS/keys/user%3A123%2Fdashboard" \
   -H 'Cachebox-Tags: user:123,workspace:abc,prompt-template:v2' \
   --data-binary 'dashboard bytes'
@@ -149,7 +149,7 @@ curl --http1.1 -i \
 Invalidate all keys in a namespace with a tag:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X POST "$BASE/v1/namespaces/$NS/tags/user%3A123/invalidate"
 ```
 
@@ -166,7 +166,7 @@ It is useful for measuring recomputation cost before enabling future cost-aware
 policy experiments:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT "$BASE/v1/namespaces/$NS/keys/llm%3Aanswer" \
   -H 'Cachebox-Cost: 1200' \
   --data-binary 'model output'
@@ -189,7 +189,7 @@ stale key while other clients avoid duplicating the same work.
 Start a lease:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X POST "$BASE/v1/namespaces/$NS/leases/prompt%3Aabc" \
   -H 'Content-Type: application/json' \
   --data '{"lease_ttl_ms":10000}'
@@ -216,7 +216,7 @@ Possible states:
 Complete a granted lease:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT "$BASE/v1/namespaces/$NS/leases/prompt%3Aabc/complete" \
   -H 'Cachebox-Lease-Token: lease-1' \
   -H 'Cachebox-TTL: 5m' \
@@ -249,13 +249,13 @@ Behavior:
 Health:
 
 ```sh
-curl --http1.1 "$BASE/healthz"
+curl --http2-prior-knowledge "$BASE/healthz"
 ```
 
 Metrics:
 
 ```sh
-curl --http1.1 "$BASE/metrics"
+curl --http2-prior-knowledge "$BASE/metrics"
 ```
 
 Important metrics:

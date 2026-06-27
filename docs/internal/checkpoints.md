@@ -106,8 +106,7 @@ Next risk:
 What works:
 
 - The binary starts an axum/tokio HTTP server bound to the configured address.
-- HTTP/2 support is enabled through the axum/Hyper stack, with HTTP/1.1 also
-  available for local tooling.
+- HTTP/2 support is enabled through the axum/Hyper stack.
 - `/healthz` responds through the live server.
 - PUT and GET preserve raw byte values through the HTTP API.
 - DELETE, batch get, and tag invalidation execute through the HTTP handler.
@@ -232,8 +231,7 @@ What works:
 
 Deferred:
 
-- The harness currently measures HTTP/1.1 loopback because the tiny built-in
-  client is dependency-free.
+- The harness measures persistent HTTP/2 loopback requests.
 - Results are local baselines only and are not portable performance claims.
 - Richer benchmark export formats and longer-duration runs are future work.
 

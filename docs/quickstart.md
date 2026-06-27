@@ -31,7 +31,7 @@ cargo run --bin cachebox -- --help
 ## Store A Value
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT 'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123' \
   -H 'Cachebox-TTL: 300s' \
   -H 'Cachebox-Tags: user:123,org:9' \
@@ -43,13 +43,13 @@ curl --http1.1 -i \
 Expected status:
 
 ```text
-HTTP/1.1 201 Created
+HTTP/2 201 Created
 ```
 
 ## Read A Value
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123'
 ```
 
@@ -62,20 +62,20 @@ Cachebox-Status: hit
 ## Delete A Value
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X DELETE 'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123'
 ```
 
 Expected status:
 
 ```text
-HTTP/1.1 204 No Content
+HTTP/2 204 No Content
 ```
 
 ## Check Metrics
 
 ```sh
-curl --http1.1 'http://127.0.0.1:7400/metrics'
+curl --http2-prior-knowledge 'http://127.0.0.1:7400/metrics'
 ```
 
 ## Run Tests

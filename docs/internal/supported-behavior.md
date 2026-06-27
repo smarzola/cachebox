@@ -6,7 +6,6 @@ This document describes the current Cachebox MVP surface.
 
 - Single server binary: `cachebox`.
 - Primary transport: HTTP/2 cleartext on the configured bind address.
-- Local tooling transport: HTTP/1.1 is also accepted.
 - Default bind address: `127.0.0.1:7400`.
 - Values are stored and returned as raw bytes.
 

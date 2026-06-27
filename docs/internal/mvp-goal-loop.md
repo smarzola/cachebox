@@ -141,8 +141,7 @@ Goal:
 Implementation:
 
 - Use `tokio`.
-- Support HTTP/2 and allow HTTP/1.1 for local tooling if the framework makes it
-  cheap.
+- Support HTTP/2 cleartext for local tooling and benchmark coverage.
 - Accept multiple clients.
 - Apply request body limits.
 - Keep shutdown behavior simple and testable.

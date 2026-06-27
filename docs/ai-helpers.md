@@ -164,7 +164,7 @@ chunk append protocol.
 Use `Cachebox-Cost` to record a recomputation score:
 
 ```sh
-curl --http1.1 -i \
+curl --http2-prior-knowledge -i \
   -X PUT "$BASE/v1/namespaces/default/keys/ai%3Aanswer" \
   -H 'Cachebox-Cost: 1800' \
   -H 'Cachebox-TTL: 10m' \

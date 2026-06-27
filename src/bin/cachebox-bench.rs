@@ -1,10 +1,13 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener as StdTcpListener, TcpStream};
+use std::net::TcpListener as StdTcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use cachebox::config::Config;
 use cachebox::server;
+use http::Request;
+use tokio::net::TcpStream;
+use tokio::runtime::Runtime;
 
 const WARMUP_ITERS: usize = 100;
 const MEASURE_DURATION: Duration = Duration::from_secs(1);
@@ -16,16 +19,18 @@ fn main() {
         max_value_bytes: 1024,
         ..Config::default()
     });
+    let mut client = H2Client::connect(&server.addr);
+    let mut eviction_client = H2Client::connect(&eviction_server.addr);
 
     let scenarios = [
-        bench_single_key_get(&server),
-        bench_single_key_put(&server),
-        bench_batch_get(&server),
-        bench_lease_contention(&server),
-        bench_tag_invalidation(&server),
-        bench_ttl_heavy_writes(&server),
-        bench_eviction_pressure(&eviction_server),
-        bench_cost_shaped_writes(&server),
+        bench_single_key_get(&mut client),
+        bench_single_key_put(&mut client),
+        bench_batch_get(&mut client),
+        bench_lease_contention(&mut client),
+        bench_tag_invalidation(&mut client),
+        bench_ttl_heavy_writes(&mut client),
+        bench_eviction_pressure(&mut eviction_client),
+        bench_cost_shaped_writes(&mut client),
     ];
 
     println!(
@@ -48,148 +53,99 @@ fn main() {
     }
 }
 
-fn bench_single_key_get(server: &LoopbackServer) -> BenchResult {
+fn bench_single_key_get(client: &mut H2Client) -> BenchResult {
     assert_status(
-        request(
-            "PUT",
-            &server.addr,
-            "/v1/namespaces/bench/keys/get-key",
-            &[],
-            b"value",
-        ),
+        client.request("PUT", "/v1/namespaces/bench/keys/get-key", &[], b"value"),
         201,
     );
     warmup(|| {
         assert_status(
-            request(
-                "GET",
-                &server.addr,
-                "/v1/namespaces/bench/keys/get-key",
-                &[],
-                &[],
-            ),
+            client.request("GET", "/v1/namespaces/bench/keys/get-key", &[], &[]),
             200,
         );
     });
     let result = measure("single_key_get", "cached_hit", || {
-        let response = request(
-            "GET",
-            &server.addr,
-            "/v1/namespaces/bench/keys/get-key",
-            &[],
-            &[],
-        );
+        let response = client.request("GET", "/v1/namespaces/bench/keys/get-key", &[], &[]);
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"value");
     });
-    with_memory(result, server.memory_used_bytes())
+    with_memory(result, client.memory_used_bytes())
 }
 
-fn bench_single_key_put(server: &LoopbackServer) -> BenchResult {
+fn bench_single_key_put(client: &mut H2Client) -> BenchResult {
     let mut index = 0usize;
     warmup(|| {
         let path = format!("/v1/namespaces/bench/keys/put-warmup-{index}");
         index += 1;
-        assert_status(request("PUT", &server.addr, &path, &[], b"value"), 201);
+        assert_status(client.request("PUT", &path, &[], b"value"), 201);
     });
     let result = measure("single_key_put", "unique_keys", || {
         let path = format!("/v1/namespaces/bench/keys/put-{index}");
         index += 1;
-        assert_status(request("PUT", &server.addr, &path, &[], b"value"), 201);
+        assert_status(client.request("PUT", &path, &[], b"value"), 201);
     });
-    with_memory(result, server.memory_used_bytes())
+    with_memory(result, client.memory_used_bytes())
 }
 
-fn bench_batch_get(server: &LoopbackServer) -> BenchResult {
+fn bench_batch_get(client: &mut H2Client) -> BenchResult {
     for index in 0..32 {
         let path = format!("/v1/namespaces/bench/keys/batch-{index}");
-        assert_status(request("PUT", &server.addr, &path, &[], b"value"), 201);
+        assert_status(client.request("PUT", &path, &[], b"value"), 201);
     }
     let body = br#"{"keys":["batch-0","batch-1","batch-2","batch-3","batch-4","batch-5","batch-6","batch-7","batch-8","batch-9","batch-10","batch-11","batch-12","batch-13","batch-14","batch-15","batch-16","batch-17","batch-18","batch-19","batch-20","batch-21","batch-22","batch-23","batch-24","batch-25","batch-26","batch-27","batch-28","batch-29","batch-30","batch-31"]}"#;
     warmup(|| {
         assert_status(
-            request(
-                "POST",
-                &server.addr,
-                "/v1/namespaces/bench/batch/get",
-                &[],
-                body,
-            ),
+            client.request("POST", "/v1/namespaces/bench/batch/get", &[], body),
             200,
         );
     });
     let result = measure("batch_get_32", "32_keys", || {
-        let response = request(
-            "POST",
-            &server.addr,
-            "/v1/namespaces/bench/batch/get",
-            &[],
-            body,
-        );
+        let response = client.request("POST", "/v1/namespaces/bench/batch/get", &[], body);
         assert_eq!(response.status, 200);
     });
-    with_memory(result, server.memory_used_bytes())
+    with_memory(result, client.memory_used_bytes())
 }
 
-fn bench_lease_contention(server: &LoopbackServer) -> BenchResult {
+fn bench_lease_contention(client: &mut H2Client) -> BenchResult {
     let body = br#"{"lease_ttl_ms":60000}"#;
     assert_status(
-        request(
-            "POST",
-            &server.addr,
-            "/v1/namespaces/bench/leases/contention",
-            &[],
-            body,
-        ),
+        client.request("POST", "/v1/namespaces/bench/leases/contention", &[], body),
         200,
     );
     warmup(|| {
         assert_status(
-            request(
-                "POST",
-                &server.addr,
-                "/v1/namespaces/bench/leases/contention",
-                &[],
-                body,
-            ),
+            client.request("POST", "/v1/namespaces/bench/leases/contention", &[], body),
             200,
         );
     });
     let result = measure("lease_contention", "same_missing_key", || {
-        let response = request(
-            "POST",
-            &server.addr,
-            "/v1/namespaces/bench/leases/contention",
-            &[],
-            body,
-        );
+        let response = client.request("POST", "/v1/namespaces/bench/leases/contention", &[], body);
         assert_eq!(response.status, 200);
     });
-    with_memory(result, server.memory_used_bytes())
+    with_memory(result, client.memory_used_bytes())
 }
 
-fn bench_tag_invalidation(server: &LoopbackServer) -> BenchResult {
+fn bench_tag_invalidation(client: &mut H2Client) -> BenchResult {
     let mut index = 0usize;
     warmup(|| {
-        tag_invalidation_round(server, index);
+        tag_invalidation_round(client, index);
         index += 1;
     });
     let result = measure("tag_invalidation_8", "put_then_invalidate", || {
-        tag_invalidation_round(server, index);
+        tag_invalidation_round(client, index);
         index += 1;
     });
-    with_memory(result, server.memory_used_bytes())
+    with_memory(result, client.memory_used_bytes())
 }
 
-fn bench_ttl_heavy_writes(server: &LoopbackServer) -> BenchResult {
+fn bench_ttl_heavy_writes(client: &mut H2Client) -> BenchResult {
     let mut index = 0usize;
     warmup(|| {
         let path = format!("/v1/namespaces/bench/keys/ttl-warmup-{index}");
         index += 1;
         assert_status(
-            request(
+            client.request(
                 "PUT",
-                &server.addr,
                 &path,
                 &[("Cachebox-TTL", "60s"), ("Cachebox-Stale-TTL", "60s")],
                 b"value",
@@ -201,9 +157,8 @@ fn bench_ttl_heavy_writes(server: &LoopbackServer) -> BenchResult {
         let path = format!("/v1/namespaces/bench/keys/ttl-{index}");
         index += 1;
         assert_status(
-            request(
+            client.request(
                 "PUT",
-                &server.addr,
                 &path,
                 &[("Cachebox-TTL", "60s"), ("Cachebox-Stale-TTL", "60s")],
                 b"value",
@@ -211,66 +166,53 @@ fn bench_ttl_heavy_writes(server: &LoopbackServer) -> BenchResult {
             201,
         );
     });
-    with_memory(result, server.memory_used_bytes())
+    with_memory(result, client.memory_used_bytes())
 }
 
-fn bench_eviction_pressure(server: &LoopbackServer) -> BenchResult {
+fn bench_eviction_pressure(client: &mut H2Client) -> BenchResult {
     let mut index = 0usize;
     warmup(|| {
         let path = format!("/v1/namespaces/bench/keys/evict-warmup-{index}");
         index += 1;
-        assert_status(
-            request("PUT", &server.addr, &path, &[], b"0123456789abcdef"),
-            201,
-        );
+        assert_status(client.request("PUT", &path, &[], b"0123456789abcdef"), 201);
     });
     let result = measure("eviction_pressure", "64KiB_cap", || {
         let path = format!("/v1/namespaces/bench/keys/evict-{index}");
         index += 1;
-        assert_status(
-            request("PUT", &server.addr, &path, &[], b"0123456789abcdef"),
-            201,
-        );
+        assert_status(client.request("PUT", &path, &[], b"0123456789abcdef"), 201);
     });
-    with_memory(result, server.memory_used_bytes())
+    with_memory(result, client.memory_used_bytes())
 }
 
-fn bench_cost_shaped_writes(server: &LoopbackServer) -> BenchResult {
+fn bench_cost_shaped_writes(client: &mut H2Client) -> BenchResult {
     let mut index = 0usize;
     warmup(|| {
-        cost_shaped_round(server, index);
+        cost_shaped_round(client, index);
         index += 1;
     });
     let result = measure(
         "cost_shaped_writes",
         "cheap_large_expensive_small_mixed_ttl",
         || {
-            cost_shaped_round(server, index);
+            cost_shaped_round(client, index);
             index += 1;
         },
     );
-    with_metrics(result, server)
+    with_metrics(result, client)
 }
 
-fn tag_invalidation_round(server: &LoopbackServer, index: usize) {
+fn tag_invalidation_round(client: &mut H2Client, index: usize) {
     let tag = format!("tag-{index}");
     for item in 0..8 {
         let path = format!("/v1/namespaces/bench/keys/tag-{index}-{item}");
         assert_status(
-            request(
-                "PUT",
-                &server.addr,
-                &path,
-                &[("Cachebox-Tags", &tag)],
-                b"value",
-            ),
+            client.request("PUT", &path, &[("Cachebox-Tags", &tag)], b"value"),
             201,
         );
     }
     assert_status(
-        request(
+        client.request(
             "POST",
-            &server.addr,
             &format!("/v1/namespaces/bench/tags/{tag}/invalidate"),
             &[],
             &[],
@@ -279,7 +221,7 @@ fn tag_invalidation_round(server: &LoopbackServer, index: usize) {
     );
 }
 
-fn cost_shaped_round(server: &LoopbackServer, index: usize) {
+fn cost_shaped_round(client: &mut H2Client, index: usize) {
     let large_value = [b'x'; 512];
     let writes = [
         (
@@ -299,7 +241,7 @@ fn cost_shaped_round(server: &LoopbackServer, index: usize) {
         ),
     ];
     for (path, headers, body) in writes {
-        assert_status(request("PUT", &server.addr, &path, &headers, body), 201);
+        assert_status(client.request("PUT", &path, &headers, body), 201);
     }
 }
 
@@ -331,7 +273,7 @@ fn summarize(
     let iterations = samples.len();
     BenchResult {
         name,
-        transport: "loopback_http1",
+        transport: "loopback_h2",
         iterations,
         p50_ns: percentile_ns(&samples, 50),
         p95_ns: percentile_ns(&samples, 95),
@@ -353,9 +295,9 @@ fn with_memory(mut result: BenchResult, memory_used_bytes: usize) -> BenchResult
     result
 }
 
-fn with_metrics(mut result: BenchResult, server: &LoopbackServer) -> BenchResult {
-    result.memory_used_bytes = server.memory_used_bytes();
-    result.cost_score_total = server.cost_score_total();
+fn with_metrics(mut result: BenchResult, client: &mut H2Client) -> BenchResult {
+    result.memory_used_bytes = client.memory_used_bytes();
+    result.cost_score_total = client.cost_score_total();
     result
 }
 
@@ -393,94 +335,121 @@ impl LoopbackServer {
             });
         });
 
-        let server = Self { addr };
-        wait_for_health(&server.addr);
-        server
+        Self { addr }
+    }
+}
+
+struct H2Client {
+    runtime: Runtime,
+    authority: String,
+    sender: h2::client::SendRequest<Bytes>,
+}
+
+impl H2Client {
+    fn connect(addr: &str) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let runtime = Runtime::new().expect("benchmark h2 runtime");
+            match runtime.block_on(Self::try_connect(addr)) {
+                Ok((sender, authority)) => {
+                    let mut client = Self {
+                        runtime,
+                        authority,
+                        sender,
+                    };
+                    wait_for_health(&mut client);
+                    return client;
+                }
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                Err(error) => panic!("benchmark h2 client did not connect: {error}"),
+            }
+        }
     }
 
-    fn memory_used_bytes(&self) -> usize {
-        let response = request("GET", &self.addr, "/metrics", &[], &[]);
+    async fn try_connect(
+        addr: &str,
+    ) -> Result<(h2::client::SendRequest<Bytes>, String), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let stream = TcpStream::connect(addr).await?;
+        let (sender, connection) = h2::client::handshake(stream).await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                eprintln!("benchmark h2 connection error: {error}");
+            }
+        });
+        Ok((sender, addr.to_string()))
+    }
+
+    fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Response {
+        let authority = self.authority.clone();
+        let sender = &mut self.sender;
+        self.runtime
+            .block_on(h2_request(sender, &authority, method, path, headers, body))
+            .expect("h2 request should succeed")
+    }
+
+    fn memory_used_bytes(&mut self) -> usize {
+        let response = self.request("GET", "/metrics", &[], &[]);
         assert_eq!(response.status, 200);
         let body = String::from_utf8(response.body).expect("metrics utf-8");
         metric_value(&body, "cachebox_memory_used_bytes")
     }
 
-    fn cost_score_total(&self) -> usize {
-        let response = request("GET", &self.addr, "/metrics", &[], &[]);
+    fn cost_score_total(&mut self) -> usize {
+        let response = self.request("GET", "/metrics", &[], &[]);
         assert_eq!(response.status, 200);
         let body = String::from_utf8(response.body).expect("metrics utf-8");
         metric_value(&body, "cachebox_cost_score_total")
     }
 }
 
-fn wait_for_health(addr: &str) {
+async fn h2_request(
+    sender: &mut h2::client::SendRequest<Bytes>,
+    authority: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
+    let mut ready = sender.clone().ready().await?;
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", authority);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(())?;
+    let (response_future, mut stream) = ready.send_request(request, body.is_empty())?;
+    if !body.is_empty() {
+        stream.send_data(Bytes::copy_from_slice(body), true)?;
+    }
+
+    let response = response_future.await?;
+    let status = response.status().as_u16();
+    let mut body = Vec::new();
+    let mut recv = response.into_body();
+    while let Some(chunk) = recv.data().await {
+        body.extend_from_slice(&chunk?);
+    }
+    Ok(Response { status, body })
+}
+
+fn wait_for_health(client: &mut H2Client) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if request_fallible("GET", addr, "/healthz", &[], &[])
-            .map(|response| response.status == 200)
-            .unwrap_or(false)
-        {
+        if client.request("GET", "/healthz", &[], &[]).status == 200 {
             return;
         }
         thread::sleep(Duration::from_millis(20));
     }
     panic!("benchmark loopback server did not become healthy");
-}
-
-fn request(
-    method: &str,
-    addr: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> Response {
-    request_fallible(method, addr, path, headers, body).expect("request should succeed")
-}
-
-fn request_fallible(
-    method: &str,
-    addr: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> std::io::Result<Response> {
-    let mut stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n",
-        body.len()
-    )?;
-    for (name, value) in headers {
-        write!(stream, "{name}: {value}\r\n")?;
-    }
-    stream.write_all(b"\r\n")?;
-    stream.write_all(body)?;
-
-    let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes)?;
-    Ok(parse_response(&bytes))
-}
-
-fn parse_response(bytes: &[u8]) -> Response {
-    let separator = b"\r\n\r\n";
-    let split = bytes
-        .windows(separator.len())
-        .position(|window| window == separator)
-        .expect("response headers");
-    let headers = std::str::from_utf8(&bytes[..split]).expect("headers utf-8");
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|status| status.parse::<u16>().ok())
-        .expect("status code");
-    Response {
-        status,
-        body: bytes[split + separator.len()..].to_vec(),
-    }
 }
 
 fn metric_value(body: &str, name: &str) -> usize {

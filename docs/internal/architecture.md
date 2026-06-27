@@ -73,7 +73,7 @@ still being established.
 Responsibilities:
 
 - Bind an HTTP address.
-- Serve HTTP/2 by default and allow HTTP/1.1 for local tooling if cheap.
+- Serve HTTP/2 cleartext by default.
 - Enforce max connection and request limits.
 - Preserve request and response bodies as bytes.
 - Apply request body size limits.
