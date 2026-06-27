@@ -55,6 +55,9 @@ Cachebox should expose first-class cache operations:
 - Cost-aware eviction hints.
 - Built-in cache diagnostics.
 
+The planned HTTP server stack is `axum` on `tokio`/Hyper. The current codebase
+defines and tests the API contract before adding the listener dependency.
+
 Example data-plane requests:
 
 ```http
@@ -83,8 +86,17 @@ Content-Type: application/json
 
 ```text
 src/
+  api.rs               HTTP API route constants and future routing
+  config.rs            no-dependency CLI and startup configuration parsing
+  engine.rs            cache engine boundary
+  lib.rs               library module exports
   main.rs              binary entrypoint
+  operation.rs         typed cache operation boundary
+  server.rs            server startup boundary
 docs/
+  checkpoints.md       clean checkpoint notes from the MVP loop
+  benchmarks.md        local benchmark command and baseline
+  supported-behavior.md supported and unsupported MVP behavior
   architecture.md      product and system architecture
   mvp-goal-loop.md     implementation prompt and milestone loop
   redis-adapter.md     possible future Redis compatibility layer
@@ -95,8 +107,22 @@ docs/
 ```sh
 cargo fmt
 cargo test
-cargo run
+cargo run --bin cachebox -- --bind 127.0.0.1:7400 --max-memory-bytes 67108864 --max-value-bytes 8388608
+cargo run --bin cachebox-bench
+cargo run --bin cachebox -- --help
 ```
 
-The current binary is only a bootstrap placeholder. The implementation plan is
-in [docs/mvp-goal-loop.md](docs/mvp-goal-loop.md).
+The binary starts the local HTTP server. The API and operation parsers cover MVP
+route shapes, percent-encoded byte keys, PUT metadata headers, typed cache
+operations, raw byte value bodies, and deterministic error envelopes. The
+in-memory engine supports byte values, TTL, stale TTL, deletes, batch get, and
+tag invalidation. Memory is bounded with approximate accounting, a max value
+size, and approximate LRU eviction. `/metrics` exposes Prometheus-style process
+metrics for requests, cache outcomes, errors, memory, expirations, and
+evictions. Lease start and completion provide the first stampede-protection
+path. Benchmark baselines and the reproducible command live in
+[docs/benchmarks.md](docs/benchmarks.md). Supported and unsupported behavior is
+documented in [docs/supported-behavior.md](docs/supported-behavior.md). The
+implementation plan is in
+[docs/mvp-goal-loop.md](docs/mvp-goal-loop.md), with completed checkpoints in
+[docs/checkpoints.md](docs/checkpoints.md).

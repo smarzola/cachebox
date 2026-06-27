@@ -45,13 +45,30 @@ HTTP server
 Each shard should own its data so ordinary read and write paths avoid global
 locks. Batch operations can fan out to multiple shards.
 
+## Current Module Baseline
+
+The repository starts with narrow module boundaries that match the MVP plan:
+
+- `config` parses startup options without adding a CLI dependency yet.
+- `api` owns HTTP route constants and will grow route parsing.
+- `operation` owns typed cache operation definitions.
+- `engine` owns the in-memory cache implementation boundary.
+- `server` owns startup behavior and will grow the Tokio HTTP listener.
+
+The binary is intentionally runnable before networking exists. It prints the
+resolved startup configuration and exits successfully.
+
 ## Core Components
 
 ### HTTP Runtime
 
-Use `tokio` plus a Rust HTTP stack that supports HTTP/2 cleanly. The exact
-framework should be chosen during implementation, but the transport should keep
-raw-byte bodies efficient and avoid forcing JSON for cached values.
+Use `tokio` plus `axum` on Hyper. That stack supports HTTP/2 cleanly while
+keeping raw-byte bodies efficient and avoiding JSON requirements for cached
+values.
+
+The current binary starts this stack with a shared in-memory engine protected by
+a mutex. That is intentionally simple for correctness while the MVP behavior is
+still being established.
 
 Responsibilities:
 
@@ -78,10 +95,17 @@ Initial endpoints:
 - `GET /healthz`
 - `GET /metrics`
 
+The current contract parser accepts those route shapes without opening sockets.
+Key and tag path segments are percent-decoded into raw bytes so cache values and
+keys do not depend on UTF-8. Namespaces are intentionally ASCII-only for the
+MVP.
+
 Value rules:
 
 - Cache values are raw bytes.
 - Metadata travels in headers for simple operations.
+- PUT metadata headers are `Cachebox-TTL`, `Cachebox-Stale-TTL`,
+  `Cachebox-Tags`, `Cachebox-Cost`, and `Content-Type`.
 - Structured states such as lease responses use JSON.
 - Keys in paths must be percent-encoded.
 - Batch endpoints use JSON request bodies initially and may gain a binary format
@@ -100,6 +124,14 @@ MVP operation set:
 - Invalidate tag.
 - Start lease for stampede protection.
 - Complete lease with refreshed value.
+
+The current parser validates method, path, headers, and control bodies before
+building operations. Raw value bodies are preserved as bytes for PUT and lease
+completion. Batch and lease-start bodies use small JSON control envelopes.
+The HTTP handler executes get, put, delete, batch get, tag invalidation, lease
+start, and lease completion against the engine. Lease behavior is process-local
+and in-memory: concurrent misses grant one lease, stale values are served while a
+refresh lease is active, and expired leases can be reacquired.
 
 API principle:
 
@@ -132,9 +164,15 @@ Expiration:
 - Stale values can be served only when an operation explicitly allows stale
   responses.
 
+The current engine implements the in-memory path with an injectable clock. It
+stores byte keys and values per namespace, returns distinct fresh, stale, and
+miss outcomes, removes expired entries lazily, and keeps tag indexes scoped by
+namespace. It also tracks estimated memory use and enforces configured memory
+and value-size limits.
+
 Eviction:
 
-- MVP can use simple random or approximate LRU eviction.
+- MVP uses approximate LRU eviction.
 - Later versions should support cost-aware policies:
   - access recency
   - access frequency
@@ -149,6 +187,12 @@ Memory accounting:
 - Enforce a hard configured memory cap.
 - Refuse or evict before accepting writes that exceed the cap.
 - Add a maximum value size.
+
+Current accounting is intentionally approximate. Each entry counts namespace,
+key, value, tag bytes, and a fixed per-entry overhead. Writes reject a single
+value over `--max-value-bytes`, reject an entry that cannot fit
+`--max-memory-bytes`, reclaim expired entries, and then evict least-recently-used
+live entries until the new value fits.
 
 ### Observability
 
@@ -167,6 +211,11 @@ MVP observability should include:
 
 Expose metrics through HTTP. A Prometheus-compatible `/metrics` endpoint is the
 preferred default.
+
+The current `/metrics` endpoint emits Prometheus-style text backed by handler
+counters and engine stats. Startup and Ctrl-C shutdown logs are key-value text.
+Per-connection tracking is not wired yet, so the connection gauge is exposed as
+zero until a connection instrumentation layer lands.
 
 ## Cache API Semantics
 
@@ -245,13 +294,13 @@ Each namespace can define:
 - Make memory accounting cheap and approximate enough to stay fast.
 - Prefer predictable bounded work per request.
 
+The current benchmark harness is `cargo run --bin cachebox-bench`. It measures
+loopback HTTP scenarios and documents local baseline output in
+`docs/benchmarks.md`.
+
 ## Open Design Questions
 
-- Which Rust HTTP stack should the MVP use?
-- Should local development allow HTTP/1.1 by default alongside HTTP/2?
-- Should batch endpoints start as JSON or use a compact binary format
-  immediately?
 - Which first official clients should be written: TypeScript, Python, Rust, or
   Go?
-- Should eviction start with random eviction for simplicity or approximate LRU
-  for better cache behavior?
+- Should batch endpoints gain a compact binary format after the JSON MVP?
+- When should namespace-specific quotas and auth be introduced?
