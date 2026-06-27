@@ -17,6 +17,25 @@ MVP.
 - Support raw bytes and streamed responses.
 - Avoid becoming a vector database or model gateway.
 
+## Existing Foundation
+
+The MVP already has several primitives that AI-native features should build on:
+
+- Raw-byte keys and values, so clients can store model responses, embeddings,
+  serialized documents, and binary artifacts without forcing JSON encoding.
+- Fresh TTL and stale TTL metadata for serving known-good values while refresh
+  work happens.
+- Tag invalidation for model, prompt, document, collection, workspace, and
+  policy changes.
+- Lease start and completion for stampede protection around expensive
+  generation or embedding work.
+- `Cachebox-Cost`, which is parsed on writes and reserved for future policy.
+- Prometheus-style metrics for cache outcomes, leases, errors, memory, and
+  evictions.
+
+AI-specific work should first make these primitives easier to use from clients
+before adding new server behavior.
+
 ## Prompt and Result Cache
 
 Applications should be able to cache model outputs using normalized request
@@ -39,11 +58,13 @@ The server should not need to understand prompt semantics in the MVP. Official
 clients can provide helpers that generate stable cache keys from structured
 model requests.
 
-Future metadata:
+Metadata:
 
 - Token input count.
 - Token output count.
-- Estimated cost.
+- Estimated or user-provided cost. The server already accepts `Cachebox-Cost`
+  as a reserved unsigned integer, but the current eviction policy does not use
+  it.
 - Latency saved.
 - Safety or policy version.
 - Model fingerprint.
@@ -86,6 +107,11 @@ Possible behavior:
 - Later clients can replay the cached stream.
 - If generation fails, Cachebox can discard the partial value or retain it only
   when explicitly allowed.
+
+The conservative first version should be client-side buffer-then-commit:
+capture streamed chunks in the client, return them to the caller as they arrive,
+and complete the Cachebox lease with one raw-byte value only after generation
+succeeds.
 
 Open questions:
 
@@ -196,6 +222,11 @@ Potential helpers:
 - Tag builder for documents, models, and workspaces.
 
 This keeps Cachebox independent from specific model providers.
+
+Lease helpers should match currently supported server behavior. The lease start
+request parses `allow_stale_ms`, but the server does not apply that field yet;
+helpers should treat stale serving as controlled by the entry's stored stale TTL
+until request-scoped stale controls are implemented.
 
 ## Non-Goals
 
