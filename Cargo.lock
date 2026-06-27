@@ -72,7 +72,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
- "h2",
  "http",
  "http-body-util",
  "serde",
