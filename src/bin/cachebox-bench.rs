@@ -53,10 +53,13 @@ async fn async_main() {
     let scenarios = [
         bench_engine_get(),
         bench_engine_put(),
+        bench_engine_tag_invalidate_8(),
         bench_single_key_get(&mut client).await,
         bench_single_key_put(&mut client).await,
         bench_batch_get(&mut client).await,
         bench_lease_contention(&mut client).await,
+        bench_tag_invalidate_empty(&mut client).await,
+        bench_tag_invalidate_8(&mut client).await,
         bench_tag_invalidation(&mut client).await,
         bench_ttl_heavy_writes(&mut client).await,
         bench_eviction_pressure(&mut eviction_client).await,
@@ -120,6 +123,35 @@ fn bench_engine_put() -> BenchResult {
             .put(put_command("bench", key.as_bytes(), b"value"))
             .expect("engine put should fit");
     });
+    with_memory(result, engine.memory_used_bytes())
+}
+
+fn bench_engine_tag_invalidate_8() -> BenchResult {
+    let mut engine = Engine::new();
+    let mut index = 0usize;
+    warmup_sync(|| {
+        let tag = engine_put_tagged_values(&mut engine, index);
+        assert_eq!(engine.invalidate_tag("bench", &tag), 8);
+        index += 1;
+    });
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let tag = engine_put_tagged_values(&mut engine, index);
+        index += 1;
+        let sample_started = Instant::now();
+        assert_eq!(engine.invalidate_tag("bench", &tag), 8);
+        samples.push(sample_started.elapsed());
+    }
+    let measured_elapsed = total_duration(&samples);
+    let result = summarize(
+        "engine_tag_invalidate_8",
+        "engine",
+        "remove_8_tagged_keys",
+        samples,
+        measured_elapsed,
+        0,
+    );
     with_memory(result, engine.memory_used_bytes())
 }
 
@@ -217,10 +249,64 @@ async fn bench_tag_invalidation(client: &mut H2Client) -> BenchResult {
         tag_invalidation_round(client, index).await;
         index += 1;
     });
-    let result = measure_async!("tag_invalidation_8", "put_then_invalidate", {
+    let result = measure_async!("tag_workflow_put8_invalidate", "8_puts_plus_invalidate", {
         tag_invalidation_round(client, index).await;
         index += 1;
     });
+    with_memory(result, client.memory_used_bytes().await)
+}
+
+async fn bench_tag_invalidate_empty(client: &mut H2Client) -> BenchResult {
+    warmup_async!({
+        let response = client
+            .request(
+                "POST",
+                "/v1/namespaces/bench/tags/empty-tag/invalidate",
+                &[],
+                &[],
+            )
+            .await;
+        assert_eq!(response.status, 200);
+    });
+    let result = measure_async!("tag_invalidate_empty", "single_empty_invalidate", {
+        let response = client
+            .request(
+                "POST",
+                "/v1/namespaces/bench/tags/empty-tag/invalidate",
+                &[],
+                &[],
+            )
+            .await;
+        assert_eq!(response.status, 200);
+    });
+    with_memory(result, client.memory_used_bytes().await)
+}
+
+async fn bench_tag_invalidate_8(client: &mut H2Client) -> BenchResult {
+    let mut index = 0usize;
+    warmup_async!({
+        let tag = put_tagged_values(client, index).await;
+        invalidate_tag(client, &tag).await;
+        index += 1;
+    });
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let tag = put_tagged_values(client, index).await;
+        index += 1;
+        let sample_started = Instant::now();
+        invalidate_tag(client, &tag).await;
+        samples.push(sample_started.elapsed());
+    }
+    let measured_elapsed = total_duration(&samples);
+    let result = summarize(
+        "tag_invalidate_8",
+        "loopback_h2",
+        "single_invalidate_8_tagged_keys",
+        samples,
+        measured_elapsed,
+        0,
+    );
     with_memory(result, client.memory_used_bytes().await)
 }
 
@@ -298,6 +384,11 @@ async fn bench_cost_shaped_writes(client: &mut H2Client) -> BenchResult {
 }
 
 async fn tag_invalidation_round(client: &mut H2Client, index: usize) {
+    let tag = put_tagged_values(client, index).await;
+    invalidate_tag(client, &tag).await;
+}
+
+async fn put_tagged_values(client: &mut H2Client, index: usize) -> String {
     let tag = format!("tag-{index}");
     for item in 0..8 {
         let path = format!("/v1/namespaces/bench/keys/tag-{index}-{item}");
@@ -308,6 +399,10 @@ async fn tag_invalidation_round(client: &mut H2Client, index: usize) {
             201,
         );
     }
+    tag
+}
+
+async fn invalidate_tag(client: &mut H2Client, tag: &str) {
     assert_status(
         client
             .request(
@@ -319,6 +414,17 @@ async fn tag_invalidation_round(client: &mut H2Client, index: usize) {
             .await,
         200,
     );
+}
+
+fn engine_put_tagged_values(engine: &mut Engine, index: usize) -> String {
+    let tag = format!("tag-{index}");
+    for item in 0..8 {
+        let key = format!("tag-{index}-{item}");
+        let mut command = put_command("bench", key.as_bytes(), b"value");
+        command.tags = vec![tag.clone()];
+        engine.put(command).expect("engine put should fit");
+    }
+    tag
 }
 
 async fn cost_shaped_round(client: &mut H2Client, index: usize) {
@@ -407,6 +513,13 @@ fn summarize(
 fn percentile_ns(samples: &[Duration], percentile: usize) -> u128 {
     let index = (samples.len() * percentile / 100).min(samples.len().saturating_sub(1));
     samples[index].as_nanos()
+}
+
+fn total_duration(samples: &[Duration]) -> Duration {
+    samples
+        .iter()
+        .copied()
+        .fold(Duration::ZERO, |total, sample| total + sample)
 }
 
 fn with_memory(mut result: BenchResult, memory_used_bytes: usize) -> BenchResult {
