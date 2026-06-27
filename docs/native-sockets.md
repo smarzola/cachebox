@@ -24,75 +24,100 @@ If `/tmp/cachebox.sock` is a stale socket file, Cachebox removes it before
 binding. If another process is actively listening on that socket, startup fails.
 Non-socket files are never removed.
 
-## Rust Unix Socket Example
+## Rust Client Example
 
-This example stores and reads raw bytes over the native Unix socket using the
-same codec exposed by the `cachebox` crate.
+This example uses the native client API over a Unix socket. Use
+`NativeClient::connect_tcp("127.0.0.1:7401")` for TCP.
 
 ```rust
-use cachebox::protocol::{
-    Command, HEADER_LEN, Metadata, RequestFrame, RequestPayload, ResponsePayload,
-    decode_response_frame, encode_request_frame,
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-
-async fn roundtrip(
-    stream: &mut UnixStream,
-    request: RequestFrame,
-) -> std::io::Result<ResponsePayload> {
-    stream.write_all(&encode_request_frame(&request)).await?;
-
-    let mut header = [0u8; HEADER_LEN];
-    stream.read_exact(&mut header).await?;
-    let payload_len =
-        u32::from_be_bytes(header[16..20].try_into().expect("header payload length")) as usize;
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload_len);
-    frame.extend_from_slice(&header);
-    frame.resize(HEADER_LEN + payload_len, 0);
-    stream.read_exact(&mut frame[HEADER_LEN..]).await?;
-
-    Ok(decode_response_frame(&frame, usize::MAX)
-        .expect("native response should decode")
-        .payload)
-}
+use cachebox::api::Ttl;
+use cachebox::client::NativeClient;
+use cachebox::protocol::{BatchItem, Metadata, ResponsePayload};
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let mut stream = UnixStream::connect("/tmp/cachebox.sock").await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = NativeClient::connect_unix("/tmp/cachebox.sock").await?;
 
-    let stored = roundtrip(
-        &mut stream,
-        RequestFrame {
-            request_id: 1,
-            command: Command::Put,
-            payload: RequestPayload::Put {
-                namespace: "default".to_string(),
-                key: b"user:123".to_vec(),
-                metadata: Metadata::default(),
-                value: b"cached bytes".to_vec(),
+    client
+        .put(
+            "default",
+            b"user:123".to_vec(),
+            Metadata {
+                ttl: Some(Ttl {
+                    milliseconds: 60_000,
+                }),
+                stale_ttl: Some(Ttl {
+                    milliseconds: 60_000,
+                }),
+                tags: vec!["user:123".to_string()],
+                ..Metadata::default()
             },
-        },
-    )
-    .await?;
-    assert_eq!(stored, ResponsePayload::Stored { evicted: 0 });
+            b"cached bytes".to_vec(),
+        )
+        .await?;
 
-    let hit = roundtrip(
-        &mut stream,
-        RequestFrame {
-            request_id: 2,
-            command: Command::Get,
-            payload: RequestPayload::Get {
-                namespace: "default".to_string(),
-                key: b"user:123".to_vec(),
-            },
-        },
-    )
-    .await?;
+    let hit = client.get("default", b"user:123".to_vec()).await?;
     assert_eq!(hit, ResponsePayload::Hit(b"cached bytes".to_vec()));
+
+    let batch = client
+        .batch_get(
+            "default",
+            vec![b"user:123".to_vec(), b"missing".to_vec()],
+        )
+        .await?;
+    assert_eq!(
+        batch,
+        vec![
+            BatchItem::Hit(b"cached bytes".to_vec()),
+            BatchItem::Miss,
+        ]
+    );
+
+    let lease = client
+        .start_lease("default", b"expensive".to_vec(), 10_000, None)
+        .await?;
+    let token = match lease {
+        ResponsePayload::LeaseGranted { lease_token, .. } => lease_token,
+        other => panic!("expected lease grant, got {other:?}"),
+    };
+
+    client
+        .complete_lease(
+            "default",
+            b"expensive".to_vec(),
+            token,
+            Metadata::default(),
+            b"fresh bytes".to_vec(),
+        )
+        .await?;
+
+    let removed = client.invalidate_tag("default", "user:123").await?;
+    assert_eq!(removed, 1);
+
+    let deleted = client.delete("default", b"expensive".to_vec()).await?;
+    assert!(deleted);
 
     Ok(())
 }
+```
+
+The low-level codec remains available if a client wants direct frame control:
+
+```rust
+use cachebox::protocol::{
+    Command, Metadata, RequestFrame, RequestPayload, encode_request_frame,
+};
+
+let bytes = encode_request_frame(&RequestFrame {
+    request_id: 1,
+    command: Command::Put,
+    payload: RequestPayload::Put {
+        namespace: "default".to_string(),
+        key: b"user:123".to_vec(),
+        metadata: Metadata::default(),
+        value: b"cached bytes".to_vec(),
+    },
+});
 ```
 
 See [the native protocol specification](internal/native-socket-protocol.md) for
