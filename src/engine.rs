@@ -295,22 +295,19 @@ where
         .map_err(CompleteLeaseError::Put)
     }
 
-    pub fn len(&mut self) -> usize {
-        self.remove_expired();
+    pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    pub fn is_empty(&mut self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn memory_used_bytes(&mut self) -> usize {
-        self.remove_expired();
+    pub fn memory_used_bytes(&self) -> usize {
         self.memory_used_bytes
     }
 
-    pub fn cost_score_total(&mut self) -> u64 {
-        self.remove_expired();
+    pub fn cost_score_total(&self) -> u64 {
         self.cost_score_total
     }
 
@@ -322,6 +319,10 @@ where
         self.stats
     }
 
+    pub fn reclaim_expired(&mut self) -> usize {
+        self.remove_expired()
+    }
+
     fn entry_state(&self, id: &EntryId) -> EntryState {
         let Some(entry) = self.entries.get(id) else {
             return EntryState::Missing;
@@ -330,7 +331,7 @@ where
         entry_state_at(entry, now_ms)
     }
 
-    fn remove_expired(&mut self) {
+    fn remove_expired(&mut self) -> usize {
         let now_ms = self.clock.now_ms();
         let mut expired = Vec::new();
         while let Some(key) = self.expiry_index.first().cloned() {
@@ -341,11 +342,14 @@ where
             expired.push(key.id);
         }
 
+        let mut removed = 0;
         for id in expired {
             if self.remove_entry(&id) {
                 self.stats.expirations += 1;
+                removed += 1;
             }
         }
+        removed
     }
 
     fn remove_entry(&mut self, id: &EntryId) -> bool {
@@ -940,7 +944,30 @@ mod tests {
     }
 
     #[test]
-    fn cost_score_total_tracks_live_entries() {
+    fn accounting_accessors_do_not_reclaim_expired_entries() {
+        let (mut engine, clock) = engine();
+        let mut expiring = put("default", b"k", b"value");
+        expiring.ttl = Some(Ttl { milliseconds: 10 });
+        expiring.cost = Some(99);
+        engine.put(expiring).expect("expiring value should fit");
+
+        let memory_before_expiry = engine.memory_used_bytes();
+        clock.advance(11);
+
+        assert_eq!(engine.len(), 1);
+        assert_eq!(engine.memory_used_bytes(), memory_before_expiry);
+        assert_eq!(engine.cost_score_total(), 99);
+        assert_eq!(engine.stats().expirations, 0);
+
+        assert_eq!(engine.reclaim_expired(), 1);
+        assert_eq!(engine.len(), 0);
+        assert_eq!(engine.memory_used_bytes(), 0);
+        assert_eq!(engine.cost_score_total(), 0);
+        assert_eq!(engine.stats().expirations, 1);
+    }
+
+    #[test]
+    fn cost_score_total_tracks_accounted_entries_until_reclaimed() {
         let (mut engine, clock) = engine();
         let mut first = put("default", b"a", b"value");
         first.cost = Some(10);
@@ -961,6 +988,8 @@ mod tests {
         assert_eq!(engine.cost_score_total(), 7);
 
         clock.advance(11);
+        assert_eq!(engine.cost_score_total(), 7);
+        assert_eq!(engine.reclaim_expired(), 1);
         assert_eq!(engine.cost_score_total(), 0);
     }
 

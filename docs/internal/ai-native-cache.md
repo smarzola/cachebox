@@ -80,8 +80,8 @@ Metadata:
 - Token input count.
 - Token output count.
 - Estimated or user-provided cost. The server accepts `Cachebox-Cost` as an
-  unsigned integer and exposes the live aggregate as `cachebox_cost_score_total`,
-  but the current eviction policy does not use it.
+  unsigned integer and exposes the currently accounted aggregate as
+  `cachebox_cost_score_total`, but the current eviction policy does not use it.
 - Latency saved.
 - Safety or policy version.
 - Model fingerprint.

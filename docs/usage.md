@@ -161,9 +161,9 @@ Example response:
 
 ## Cost Metadata
 
-`Cachebox-Cost` stores a user-provided unsigned integer score for live entries.
-It is useful for measuring recomputation cost before enabling future cost-aware
-policy experiments:
+`Cachebox-Cost` stores a user-provided unsigned integer score. It is useful for
+measuring recomputation cost before enabling future cost-aware policy
+experiments:
 
 ```sh
 curl --http2-prior-knowledge -i \
@@ -172,7 +172,8 @@ curl --http2-prior-knowledge -i \
   --data-binary 'model output'
 ```
 
-The live aggregate is exposed by `/metrics`:
+The currently accounted aggregate is exposed by `/metrics`. Metrics reads are
+observational and do not reclaim expired entries:
 
 ```text
 cachebox_cost_score_total 1200
@@ -243,8 +244,8 @@ Behavior:
 - Single values over `--max-value-bytes` are rejected.
 - Writes evict bounded-sample approximate least-recently-used entries when
   memory is tight.
-- Expired entries are tracked in an expiry index and reclaimed before live
-  entries are evicted.
+- Expired entries are tracked in an expiry index and reclaimed by cache access
+  paths or before live entries are evicted.
 
 ## Health And Metrics
 

@@ -169,8 +169,8 @@ stores byte keys and values per namespace, returns distinct fresh, stale, and
 miss outcomes, removes expired entries lazily, and keeps tag indexes scoped by
 namespace. It also tracks estimated memory use and enforces configured memory
 and value-size limits. `Cachebox-Cost` is stored as optional entry metadata and
-exposed as aggregate live cost score for experiments, but it does not affect the
-default eviction policy.
+exposed as an aggregate accounted cost score for experiments, but it does not
+affect the default eviction policy.
 
 Eviction:
 
@@ -217,9 +217,11 @@ Expose metrics through HTTP. A Prometheus-compatible `/metrics` endpoint is the
 preferred default.
 
 The current `/metrics` endpoint emits Prometheus-style text backed by handler
-counters and engine stats. Startup and Ctrl-C shutdown logs are key-value text.
-Per-connection tracking is not wired yet, so the connection gauge is exposed as
-zero until a connection instrumentation layer lands.
+counters and engine stats. It is observational: scraping metrics does not
+reclaim expired entries or increment request counters. Startup and Ctrl-C
+shutdown logs are key-value text. Per-connection tracking is not wired yet, so
+the connection gauge is exposed as zero until a connection instrumentation layer
+lands.
 
 ## Cache API Semantics
 

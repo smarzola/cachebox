@@ -40,7 +40,6 @@ pub struct AppState {
 struct Metrics {
     requests_total: AtomicU64,
     health_requests: AtomicU64,
-    metrics_requests: AtomicU64,
     get_requests: AtomicU64,
     put_requests: AtomicU64,
     delete_requests: AtomicU64,
@@ -59,7 +58,6 @@ impl Metrics {
         MetricsSnapshot {
             requests_total: self.requests_total.load(Ordering::Relaxed),
             health_requests: self.health_requests.load(Ordering::Relaxed),
-            metrics_requests: self.metrics_requests.load(Ordering::Relaxed),
             get_requests: self.get_requests.load(Ordering::Relaxed),
             put_requests: self.put_requests.load(Ordering::Relaxed),
             delete_requests: self.delete_requests.load(Ordering::Relaxed),
@@ -79,7 +77,6 @@ impl Metrics {
 struct MetricsSnapshot {
     requests_total: u64,
     health_requests: u64,
-    metrics_requests: u64,
     get_requests: u64,
     put_requests: u64,
     delete_requests: u64,
@@ -140,7 +137,20 @@ async fn handle_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let path = uri.path();
+    if method == HttpMethod::GET && path == crate::api::METRICS_ROUTE {
+        return metrics_response(&state);
+    }
+
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    if method == HttpMethod::GET && path == crate::api::HEALTH_ROUTE {
+        state
+            .metrics
+            .health_requests
+            .fetch_add(1, Ordering::Relaxed);
+        return (HttpStatusCode::OK, "ok").into_response();
+    }
 
     if body.len() > state.max_body_bytes {
         state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -151,22 +161,6 @@ async fn handle_request(
                 message: format!("request body exceeds {} byte limit", state.max_body_bytes),
             },
         );
-    }
-
-    let path = uri.path();
-    if method == HttpMethod::GET && path == crate::api::HEALTH_ROUTE {
-        state
-            .metrics
-            .health_requests
-            .fetch_add(1, Ordering::Relaxed);
-        return (HttpStatusCode::OK, "ok").into_response();
-    }
-    if method == HttpMethod::GET && path == crate::api::METRICS_ROUTE {
-        state
-            .metrics
-            .metrics_requests
-            .fetch_add(1, Ordering::Relaxed);
-        return metrics_response(&state);
     }
 
     let Some(method) = convert_method(&method) else {
@@ -371,7 +365,7 @@ fn execute_operation(state: AppState, operation: Operation) -> Response {
 
 fn metrics_response(state: &AppState) -> Response {
     let snapshot = state.metrics.snapshot();
-    let mut engine = state.engine.lock().expect("engine mutex poisoned");
+    let engine = state.engine.lock().expect("engine mutex poisoned");
     let engine_stats = engine.stats();
     let memory_used_bytes = engine.memory_used_bytes();
     let cost_score_total = engine.cost_score_total();
@@ -383,7 +377,6 @@ fn metrics_response(state: &AppState) -> Response {
 # TYPE cachebox_requests_total counter
 cachebox_requests_total {}
 cachebox_requests_health_total {}
-cachebox_requests_metrics_total {}
 cachebox_requests_get_total {}
 cachebox_requests_put_total {}
 cachebox_requests_delete_total {}
@@ -406,7 +399,6 @@ cachebox_connections_current 0
 ",
         snapshot.requests_total,
         snapshot.health_requests,
-        snapshot.metrics_requests,
         snapshot.get_requests,
         snapshot.put_requests,
         snapshot.delete_requests,
@@ -948,6 +940,7 @@ mod tests {
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
         let metrics = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/metrics")
@@ -959,20 +952,35 @@ mod tests {
         assert_eq!(metrics.status(), StatusCode::OK);
         let body = String::from_utf8(response_bytes(metrics).await).expect("metrics utf-8");
 
-        assert!(body.contains("cachebox_requests_total 7"));
+        assert!(body.contains("cachebox_requests_total 6"));
         assert!(body.contains("cachebox_requests_get_total 2"));
         assert!(body.contains("cachebox_requests_put_total 4"));
-        assert!(body.contains("cachebox_requests_metrics_total 1"));
+        assert!(!body.contains("cachebox_requests_metrics_total"));
         assert!(body.contains("cachebox_cache_hits_total 1"));
         assert!(body.contains("cachebox_cache_misses_total 1"));
         assert!(body.contains("cachebox_errors_total 1"));
         assert!(body.contains("cachebox_evictions_total 1"));
         assert!(body.contains("cachebox_memory_limit_bytes 240"));
         assert!(body.contains("cachebox_connections_current 0"));
+
+        let second_metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("second metrics response");
+        assert_eq!(second_metrics.status(), StatusCode::OK);
+        let second_body =
+            String::from_utf8(response_bytes(second_metrics).await).expect("metrics utf-8");
+        assert!(second_body.contains("cachebox_requests_total 6"));
+        assert!(!second_body.contains("cachebox_requests_metrics_total"));
     }
 
     #[tokio::test]
-    async fn metrics_endpoint_reports_live_cost_score_total() {
+    async fn metrics_endpoint_reports_accounted_cost_score_total() {
         let app = app(&Config::default());
 
         let response = app

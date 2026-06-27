@@ -38,7 +38,8 @@ accepts HTTP/2 cleartext.
 - Approximate memory accounting with max body, max value, and max memory limits.
 - Approximate LRU eviction.
 - Prometheus-style `/metrics`.
-- Reserved `Cachebox-Cost` metadata with live aggregate cost-score metrics.
+- Reserved `Cachebox-Cost` metadata with side-effect-free aggregate cost-score
+  metrics.
 - Rust AI helper utilities:
   - prompt/result cache keys
   - embedding cache keys

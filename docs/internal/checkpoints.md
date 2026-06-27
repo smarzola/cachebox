@@ -81,7 +81,7 @@ What works:
 - Get, put, delete, batch get, and tag invalidation are implemented without
   networking.
 - TTL and stale TTL are evaluated with an injectable clock.
-- Expired entries are removed lazily on access and length checks.
+- Expired entries are removed lazily on cache access and write-pressure cleanup.
 - Stale entries return a distinct stale outcome until the stale window expires.
 - Deletes are idempotent.
 - Batch get preserves input order and returns mixed hits, misses, and stale

@@ -173,7 +173,8 @@ curl --http2-prior-knowledge -i \
   --data-binary 'model output bytes'
 ```
 
-The aggregate live cost score is available in Prometheus metrics:
+The currently accounted aggregate cost score is available in Prometheus
+metrics:
 
 ```text
 cachebox_cost_score_total 1800

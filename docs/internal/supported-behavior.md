@@ -33,7 +33,7 @@ PUT and lease completion accept:
 - `Cachebox-TTL`: fresh lifetime, such as `300s`, `5m`, or `100ms`.
 - `Cachebox-Stale-TTL`: stale lifetime after fresh TTL expires.
 - `Cachebox-Tags`: comma-separated ASCII tags.
-- `Cachebox-Cost`: parsed, stored as live aggregate cost-score metadata, and
+- `Cachebox-Cost`: parsed, stored as aggregate cost-score metadata, and
   reserved for future policy.
 - `Content-Type`: preserved only as contract metadata; values remain raw bytes.
 
@@ -62,12 +62,14 @@ PUT and lease completion accept:
 - `--max-memory-bytes` limits approximate in-memory cache size.
 - `--max-value-bytes` limits a single cached value.
 - Eviction policy is approximate LRU.
-- Expired entries are reclaimed before live entries are evicted.
+- Expired entries are reclaimed by cache access paths or before live entries are
+  evicted.
 
 ## Metrics
 
 - `/metrics` includes `cachebox_cost_score_total`, the sum of `Cachebox-Cost`
-  values for live entries.
+  values for currently accounted entries. Scraping metrics does not reclaim
+  expired entries or increment request counters.
 - Cost score is observational only; it does not affect eviction policy yet.
 
 ## Leases
