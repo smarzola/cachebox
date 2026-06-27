@@ -41,6 +41,10 @@ before adding new server behavior.
 Applications should be able to cache model outputs using normalized request
 metadata.
 
+The Rust crate includes a provider-neutral prompt/result key helper in
+`cachebox::ai`. It turns structured prompt request fields into an ASCII byte key
+with the prefix `ai:prompt:v1:`.
+
 Cache key inputs:
 
 - Provider.
@@ -57,6 +61,19 @@ Cache key inputs:
 The server should not need to understand prompt semantics in the MVP. Official
 clients can provide helpers that generate stable cache keys from structured
 model requests.
+
+Implemented normalization rules:
+
+- The normalized payload starts with the version marker
+  `cachebox.ai.prompt.v1`.
+- Fields are encoded as length-prefixed UTF-8 bytes so empty values, missing
+  values, Unicode text, and embedded delimiters remain distinct.
+- Message order is significant.
+- JSON tool schema and sampling parameter values are canonicalized with sorted
+  object keys and compact separators.
+- Sampling parameter names are sorted lexicographically.
+- The final key is the prefix `ai:prompt:v1:` plus a stable 128-bit digest in
+  lowercase hexadecimal.
 
 Metadata:
 

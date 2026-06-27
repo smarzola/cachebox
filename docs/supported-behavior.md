@@ -37,6 +37,16 @@ PUT and lease completion accept:
 - `Cachebox-Cost`: parsed and reserved for future policy.
 - `Content-Type`: preserved only as contract metadata; values remain raw bytes.
 
+## AI Helpers
+
+- `cachebox::ai::prompt_cache_key` builds deterministic ASCII byte keys for
+  prompt/result cache entries.
+- Prompt key normalization includes provider, model, optional model version,
+  message list, optional system prompt, optional tool schema, sampling
+  parameters, optional output format, optional retrieval context hash, and
+  application namespace.
+- The helper is provider-neutral and does not call model APIs.
+
 ## Memory
 
 - `--max-body-bytes` limits accepted request body size.
