@@ -103,7 +103,10 @@ where
         }
 
         self.remove_entry(&id);
-        self.remove_expired();
+        if self.memory_used_bytes.saturating_add(entry_memory_bytes) > self.limits.max_memory_bytes
+        {
+            self.remove_expired();
+        }
         let evicted = self.evict_until_fits(entry_memory_bytes);
         if self.memory_used_bytes.saturating_add(entry_memory_bytes) > self.limits.max_memory_bytes
         {
