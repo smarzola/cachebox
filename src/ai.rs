@@ -62,6 +62,48 @@ pub struct EmbeddingCacheKeyInput {
     pub application_namespace: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationLeaseStart {
+    Hit {
+        value: Vec<u8>,
+    },
+    Stale {
+        value: Vec<u8>,
+    },
+    LeaseGranted {
+        lease_token: String,
+        stale_value: Option<Vec<u8>>,
+    },
+    LeaseDenied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationLeaseAction {
+    ReturnCached(Vec<u8>),
+    Generate {
+        lease_token: String,
+        stale_value: Option<Vec<u8>>,
+    },
+    RetryLater,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationCompletion {
+    Completed,
+    Failed {
+        lease_token: String,
+        reason: GenerationCompletionFailure,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationCompletionFailure {
+    InvalidLeaseToken,
+    ExpiredLease,
+    RejectedValue,
+    TransportError,
+}
+
 impl EmbeddingCacheKeyInput {
     pub fn new(
         model: impl Into<String>,
@@ -113,6 +155,36 @@ pub fn embedding_cache_key(input: &EmbeddingCacheKeyInput) -> Vec<u8> {
     let normalized = normalize_embedding_input(input);
     let digest = fnv1a_128(&normalized);
     digest_key(EMBEDDING_KEY_PREFIX, digest)
+}
+
+pub fn generation_lease_action(start: GenerationLeaseStart) -> GenerationLeaseAction {
+    match start {
+        GenerationLeaseStart::Hit { value } | GenerationLeaseStart::Stale { value } => {
+            GenerationLeaseAction::ReturnCached(value)
+        }
+        GenerationLeaseStart::LeaseGranted {
+            lease_token,
+            stale_value,
+        } => GenerationLeaseAction::Generate {
+            lease_token,
+            stale_value,
+        },
+        GenerationLeaseStart::LeaseDenied => GenerationLeaseAction::RetryLater,
+    }
+}
+
+pub fn generation_completion_success() -> GenerationCompletion {
+    GenerationCompletion::Completed
+}
+
+pub fn generation_completion_failure(
+    lease_token: impl Into<String>,
+    reason: GenerationCompletionFailure,
+) -> GenerationCompletion {
+    GenerationCompletion::Failed {
+        lease_token: lease_token.into(),
+        reason,
+    }
 }
 
 pub fn normalize_prompt_input(input: &PromptCacheKeyInput) -> Vec<u8> {
@@ -459,5 +531,72 @@ mod tests {
         assert!(key.starts_with(EMBEDDING_KEY_PREFIX));
         assert_eq!(key.len(), EMBEDDING_KEY_PREFIX.len() + 32);
         assert!(key.iter().all(u8::is_ascii));
+    }
+
+    #[test]
+    fn generation_lease_helper_returns_fresh_hits() {
+        let action = generation_lease_action(GenerationLeaseStart::Hit {
+            value: b"fresh".to_vec(),
+        });
+
+        assert_eq!(
+            action,
+            GenerationLeaseAction::ReturnCached(b"fresh".to_vec())
+        );
+    }
+
+    #[test]
+    fn generation_lease_helper_returns_stale_values() {
+        let action = generation_lease_action(GenerationLeaseStart::Stale {
+            value: b"stale".to_vec(),
+        });
+
+        assert_eq!(
+            action,
+            GenerationLeaseAction::ReturnCached(b"stale".to_vec())
+        );
+    }
+
+    #[test]
+    fn generation_lease_helper_generates_only_when_granted() {
+        let action = generation_lease_action(GenerationLeaseStart::LeaseGranted {
+            lease_token: "lease-1".to_string(),
+            stale_value: Some(b"old".to_vec()),
+        });
+
+        assert_eq!(
+            action,
+            GenerationLeaseAction::Generate {
+                lease_token: "lease-1".to_string(),
+                stale_value: Some(b"old".to_vec())
+            }
+        );
+    }
+
+    #[test]
+    fn generation_lease_helper_retries_later_when_denied() {
+        let action = generation_lease_action(GenerationLeaseStart::LeaseDenied);
+
+        assert_eq!(action, GenerationLeaseAction::RetryLater);
+    }
+
+    #[test]
+    fn generation_completion_failure_preserves_token_and_reason() {
+        let failure = generation_completion_failure(
+            "lease-1",
+            GenerationCompletionFailure::InvalidLeaseToken,
+        );
+
+        assert_eq!(
+            failure,
+            GenerationCompletion::Failed {
+                lease_token: "lease-1".to_string(),
+                reason: GenerationCompletionFailure::InvalidLeaseToken
+            }
+        );
+        assert_eq!(
+            generation_completion_success(),
+            GenerationCompletion::Completed
+        );
     }
 }

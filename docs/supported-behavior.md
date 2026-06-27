@@ -50,6 +50,8 @@ PUT and lease completion accept:
 - Embedding key normalization includes model, optional model version, input
   content hash, normalization settings, chunking strategy, dimensions, and
   application namespace.
+- `cachebox::ai::generation_lease_action` maps lease start states into client
+  actions: return cached bytes, generate with a lease token, or retry later.
 - The helper is provider-neutral and does not call model APIs.
 
 ## Memory
