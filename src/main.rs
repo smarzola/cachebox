@@ -15,6 +15,11 @@ async fn main() -> ExitCode {
             println!("max_body_bytes={}", report.max_body_bytes);
             println!("max_memory_bytes={}", report.max_memory_bytes);
             println!("max_value_bytes={}", report.max_value_bytes);
+            println!("cleanup_interval_ms={}", report.cleanup_interval_ms);
+            println!(
+                "cleanup_max_entries_per_tick={}",
+                report.cleanup_max_entries_per_tick
+            );
             match server::run(config).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {

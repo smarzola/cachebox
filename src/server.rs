@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, State};
@@ -12,6 +13,8 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::any};
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 use crate::api::{ErrorEnvelope, Method, StatusCode};
 use crate::config::Config;
@@ -27,6 +30,8 @@ pub struct StartupReport {
     pub max_body_bytes: usize,
     pub max_memory_bytes: usize,
     pub max_value_bytes: usize,
+    pub cleanup_interval_ms: u64,
+    pub cleanup_max_entries_per_tick: usize,
 }
 
 #[derive(Clone)]
@@ -34,6 +39,19 @@ pub struct AppState {
     engine: Arc<Mutex<Engine>>,
     metrics: Arc<Metrics>,
     max_body_bytes: usize,
+}
+
+impl AppState {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            engine: Arc::new(Mutex::new(Engine::with_limits(EngineLimits {
+                max_memory_bytes: config.max_memory_bytes,
+                max_value_bytes: config.max_value_bytes,
+            }))),
+            metrics: Arc::new(Metrics::default()),
+            max_body_bytes: config.max_body_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -96,38 +114,76 @@ pub fn startup_report(config: &Config) -> StartupReport {
         max_body_bytes: config.max_body_bytes,
         max_memory_bytes: config.max_memory_bytes,
         max_value_bytes: config.max_value_bytes,
+        cleanup_interval_ms: config.cleanup_interval_ms,
+        cleanup_max_entries_per_tick: config.cleanup_max_entries_per_tick,
     }
 }
 
 pub fn app(config: &Config) -> Router {
+    app_with_state(AppState::from_config(config))
+}
+
+fn app_with_state(state: AppState) -> Router {
     Router::new()
         .fallback(any(handle_request))
-        .with_state(AppState {
-            engine: Arc::new(Mutex::new(Engine::with_limits(EngineLimits {
-                max_memory_bytes: config.max_memory_bytes,
-                max_value_bytes: config.max_value_bytes,
-            }))),
-            metrics: Arc::new(Metrics::default()),
-            max_body_bytes: config.max_body_bytes,
-        })
+        .with_state(state)
 }
 
 pub async fn run(config: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     let local_addr = listener.local_addr()?;
     println!(
-        "event=server_start bind_addr={local_addr} max_body_bytes={} max_memory_bytes={} max_value_bytes={}",
-        config.max_body_bytes, config.max_memory_bytes, config.max_value_bytes
+        "event=server_start bind_addr={local_addr} max_body_bytes={} max_memory_bytes={} max_value_bytes={} cleanup_interval_ms={} cleanup_max_entries_per_tick={}",
+        config.max_body_bytes,
+        config.max_memory_bytes,
+        config.max_value_bytes,
+        config.cleanup_interval_ms,
+        config.cleanup_max_entries_per_tick
     );
 
-    axum::serve(listener, app(&config))
+    let state = AppState::from_config(&config);
+    let cleanup_task = spawn_expiration_worker(
+        Arc::clone(&state.engine),
+        config.cleanup_interval_ms,
+        config.cleanup_max_entries_per_tick,
+    );
+
+    let result = axum::serve(listener, app_with_state(state))
         .with_graceful_shutdown(shutdown_signal())
-        .await
+        .await;
+
+    if let Some(cleanup_task) = cleanup_task {
+        cleanup_task.abort();
+    }
+
+    result
 }
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     println!("event=server_shutdown signal=ctrl_c");
+}
+
+fn spawn_expiration_worker(
+    engine: Arc<Mutex<Engine>>,
+    interval_ms: u64,
+    max_entries_per_tick: usize,
+) -> Option<JoinHandle<()>> {
+    if interval_ms == 0 {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .reclaim_expired_budget(max_entries_per_tick);
+        }
+    }))
 }
 
 async fn handle_request(
@@ -657,6 +713,44 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_bytes(response).await, b"ok".to_vec());
+    }
+
+    #[tokio::test]
+    async fn expiration_worker_is_disabled_by_zero_interval() {
+        let state = AppState::from_config(&Config::default());
+
+        assert!(spawn_expiration_worker(Arc::clone(&state.engine), 0, 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn expiration_worker_reclaims_expired_entries_with_budget() {
+        let state = AppState::from_config(&Config::default());
+        let cleanup_task = spawn_expiration_worker(Arc::clone(&state.engine), 5, 1)
+            .expect("cleanup task should start");
+
+        {
+            let mut engine = state.engine.lock().expect("engine mutex poisoned");
+            for key in [b"a", b"b", b"c"] {
+                engine
+                    .put(PutCommand {
+                        namespace: "default".to_string(),
+                        key: key.to_vec(),
+                        value: b"value".to_vec(),
+                        ttl: Some(crate::api::Ttl { milliseconds: 1 }),
+                        stale_ttl: None,
+                        tags: Vec::new(),
+                        cost: None,
+                    })
+                    .expect("value should fit");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cleanup_task.abort();
+
+        let engine = state.engine.lock().expect("engine mutex poisoned");
+        assert_eq!(engine.len(), 0);
+        assert_eq!(engine.stats().expirations, 3);
     }
 
     #[tokio::test]

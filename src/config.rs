@@ -5,6 +5,8 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7400";
 const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_CLEANUP_INTERVAL_MS: u64 = 250;
+const DEFAULT_CLEANUP_MAX_ENTRIES_PER_TICK: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -12,6 +14,8 @@ pub struct Config {
     pub max_body_bytes: usize,
     pub max_memory_bytes: usize,
     pub max_value_bytes: usize,
+    pub cleanup_interval_ms: u64,
+    pub cleanup_max_entries_per_tick: usize,
 }
 
 impl Default for Config {
@@ -23,6 +27,8 @@ impl Default for Config {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
+            cleanup_interval_ms: DEFAULT_CLEANUP_INTERVAL_MS,
+            cleanup_max_entries_per_tick: DEFAULT_CLEANUP_MAX_ENTRIES_PER_TICK,
         }
     }
 }
@@ -36,6 +42,8 @@ pub enum ConfigError {
     InvalidMaxBodyBytes { value: String },
     InvalidMaxMemoryBytes { value: String },
     InvalidMaxValueBytes { value: String },
+    InvalidCleanupIntervalMs { value: String },
+    InvalidCleanupMaxEntriesPerTick { value: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -55,6 +63,12 @@ impl fmt::Display for ConfigError {
             }
             Self::InvalidMaxValueBytes { value } => {
                 write!(f, "invalid max value byte limit: {value}")
+            }
+            Self::InvalidCleanupIntervalMs { value } => {
+                write!(f, "invalid cleanup interval in milliseconds: {value}")
+            }
+            Self::InvalidCleanupMaxEntriesPerTick { value } => {
+                write!(f, "invalid cleanup max entries per tick: {value}")
             }
         }
     }
@@ -100,6 +114,17 @@ impl Config {
                             ConfigError::InvalidMaxValueBytes { value }
                         })?;
                 }
+                "--cleanup-interval-ms" => {
+                    config.cleanup_interval_ms = parse_u64(&argument, args.next(), |value| {
+                        ConfigError::InvalidCleanupIntervalMs { value }
+                    })?;
+                }
+                "--cleanup-max-entries-per-tick" => {
+                    config.cleanup_max_entries_per_tick =
+                        parse_nonzero_usize(&argument, args.next(), |value| {
+                            ConfigError::InvalidCleanupMaxEntriesPerTick { value }
+                        })?;
+                }
                 _ => return Err(ConfigError::UnknownArgument { argument }),
             }
         }
@@ -123,13 +148,24 @@ fn parse_nonzero_usize(
     Ok(parsed)
 }
 
+fn parse_u64(
+    flag: &str,
+    value: Option<String>,
+    error: impl Fn(String) -> ConfigError,
+) -> Result<u64, ConfigError> {
+    let value = value.ok_or_else(|| ConfigError::MissingValue {
+        flag: flag.to_string(),
+    })?;
+    value.parse::<u64>().map_err(|_| error(value.clone()))
+}
+
 pub fn help_text(program_name: &str) -> String {
     format!(
         "\
 Cachebox cache server
 
 Usage:
-  {program_name} [--bind <addr:port>] [--max-body-bytes <bytes>] [--max-memory-bytes <bytes>] [--max-value-bytes <bytes>]
+  {program_name} [--bind <addr:port>] [--max-body-bytes <bytes>] [--max-memory-bytes <bytes>] [--max-value-bytes <bytes>] [--cleanup-interval-ms <ms>] [--cleanup-max-entries-per-tick <count>]
   {program_name} --help
 
 Options:
@@ -141,6 +177,13 @@ Options:
                       Default: {DEFAULT_MAX_MEMORY_BYTES}
   --max-value-bytes   Maximum single cached value size.
                       Default: {DEFAULT_MAX_VALUE_BYTES}
+  --cleanup-interval-ms
+                      Background expired-entry cleanup interval in milliseconds.
+                      Use 0 to disable background cleanup.
+                      Default: {DEFAULT_CLEANUP_INTERVAL_MS}
+  --cleanup-max-entries-per-tick
+                      Maximum expired entries reclaimed per cleanup tick.
+                      Default: {DEFAULT_CLEANUP_MAX_ENTRIES_PER_TICK}
   -h, --help          Print this help text.
 "
     )
@@ -158,6 +201,11 @@ mod tests {
         assert_eq!(config.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
         assert_eq!(config.max_memory_bytes, DEFAULT_MAX_MEMORY_BYTES);
         assert_eq!(config.max_value_bytes, DEFAULT_MAX_VALUE_BYTES);
+        assert_eq!(config.cleanup_interval_ms, DEFAULT_CLEANUP_INTERVAL_MS);
+        assert_eq!(
+            config.cleanup_max_entries_per_tick,
+            DEFAULT_CLEANUP_MAX_ENTRIES_PER_TICK
+        );
     }
 
     #[test]
@@ -200,12 +248,25 @@ mod tests {
             "2048",
             "--max-value-bytes",
             "512",
+            "--cleanup-interval-ms",
+            "100",
+            "--cleanup-max-entries-per-tick",
+            "64",
         ])
         .expect("custom config");
 
         assert_eq!(config.max_body_bytes, 1024);
         assert_eq!(config.max_memory_bytes, 2048);
         assert_eq!(config.max_value_bytes, 512);
+        assert_eq!(config.cleanup_interval_ms, 100);
+        assert_eq!(config.cleanup_max_entries_per_tick, 64);
+    }
+
+    #[test]
+    fn allows_disabling_background_cleanup() {
+        let config = Config::from_args(["--cleanup-interval-ms", "0"]).expect("custom config");
+
+        assert_eq!(config.cleanup_interval_ms, 0);
     }
 
     #[test]
@@ -237,6 +298,24 @@ mod tests {
         assert_eq!(
             value_error,
             ConfigError::InvalidMaxValueBytes {
+                value: "0".to_string()
+            }
+        );
+
+        let interval_error = Config::from_args(["--cleanup-interval-ms", "nope"])
+            .expect_err("invalid cleanup interval should fail");
+        assert_eq!(
+            interval_error,
+            ConfigError::InvalidCleanupIntervalMs {
+                value: "nope".to_string()
+            }
+        );
+
+        let budget_error = Config::from_args(["--cleanup-max-entries-per-tick", "0"])
+            .expect_err("invalid cleanup budget should fail");
+        assert_eq!(
+            budget_error,
+            ConfigError::InvalidCleanupMaxEntriesPerTick {
                 value: "0".to_string()
             }
         );

@@ -61,9 +61,11 @@ PUT and lease completion accept:
 - `--max-body-bytes` limits accepted request body size.
 - `--max-memory-bytes` limits approximate in-memory cache size.
 - `--max-value-bytes` limits a single cached value.
+- `--cleanup-interval-ms` controls background expiration; `0` disables it.
+- `--cleanup-max-entries-per-tick` caps background expiration work per tick.
 - Eviction policy is approximate LRU.
 - Expired entries are reclaimed by cache access paths or before live entries are
-  evicted.
+  evicted, and by the bounded background cleanup worker when enabled.
 
 ## Metrics
 

@@ -81,7 +81,8 @@ What works:
 - Get, put, delete, batch get, and tag invalidation are implemented without
   networking.
 - TTL and stale TTL are evaluated with an injectable clock.
-- Expired entries are removed lazily on cache access and write-pressure cleanup.
+- Expired entries are removed lazily on cache access, write-pressure cleanup,
+  and bounded background cleanup.
 - Stale entries return a distinct stale outcome until the stale window expires.
 - Deletes are idempotent.
 - Batch get preserves input order and returns mixed hits, misses, and stale
@@ -93,7 +94,8 @@ Deferred:
 
 - Lease state waits for the HTTP server milestone before it is exposed to
   clients.
-- Background expiration is not implemented.
+- Background expiration uses the expiry index with configurable interval and
+  per-tick budget.
 - Memory accounting, value size limits, and eviction wait for Milestone 5.
 
 Next risk:

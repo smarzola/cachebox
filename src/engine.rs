@@ -108,7 +108,7 @@ where
         self.remove_entry(&id);
         if self.memory_used_bytes.saturating_add(entry_memory_bytes) > self.limits.max_memory_bytes
         {
-            self.remove_expired();
+            self.reclaim_expired();
         }
         let evicted = self.evict_until_fits(entry_memory_bytes);
         if self.memory_used_bytes.saturating_add(entry_memory_bytes) > self.limits.max_memory_bytes
@@ -320,7 +320,11 @@ where
     }
 
     pub fn reclaim_expired(&mut self) -> usize {
-        self.remove_expired()
+        self.reclaim_expired_budget(usize::MAX)
+    }
+
+    pub fn reclaim_expired_budget(&mut self, max_entries: usize) -> usize {
+        self.remove_expired(max_entries)
     }
 
     fn entry_state(&self, id: &EntryId) -> EntryState {
@@ -331,10 +335,13 @@ where
         entry_state_at(entry, now_ms)
     }
 
-    fn remove_expired(&mut self) -> usize {
+    fn remove_expired(&mut self, max_entries: usize) -> usize {
         let now_ms = self.clock.now_ms();
         let mut expired = Vec::new();
-        while let Some(key) = self.expiry_index.first().cloned() {
+        while expired.len() < max_entries {
+            let Some(key) = self.expiry_index.first().cloned() else {
+                break;
+            };
             if key.expires_at_ms > now_ms {
                 break;
             }
@@ -964,6 +971,30 @@ mod tests {
         assert_eq!(engine.memory_used_bytes(), 0);
         assert_eq!(engine.cost_score_total(), 0);
         assert_eq!(engine.stats().expirations, 1);
+    }
+
+    #[test]
+    fn reclaim_expired_budget_limits_cleanup_work() {
+        let (mut engine, clock) = engine();
+        for key in [b"a", b"b", b"c"] {
+            let mut command = put("default", key, b"value");
+            command.ttl = Some(Ttl { milliseconds: 10 });
+            engine.put(command).expect("expiring value should fit");
+        }
+
+        clock.advance(11);
+
+        assert_eq!(engine.reclaim_expired_budget(1), 1);
+        assert_eq!(engine.len(), 2);
+        assert_eq!(engine.stats().expirations, 1);
+
+        assert_eq!(engine.reclaim_expired_budget(1), 1);
+        assert_eq!(engine.len(), 1);
+        assert_eq!(engine.stats().expirations, 2);
+
+        assert_eq!(engine.reclaim_expired_budget(16), 1);
+        assert_eq!(engine.len(), 0);
+        assert_eq!(engine.stats().expirations, 3);
     }
 
     #[test]

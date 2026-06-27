@@ -161,6 +161,8 @@ Expiration:
 - Lazy expiration on reads and writes.
 - Expiration lookup uses an ordered expiry index, so reclaiming expired values
   walks expired deadlines instead of scanning the full keyspace.
+- A bounded background worker periodically reclaims expired entries from the
+  expiry index. `--cleanup-interval-ms 0` disables it.
 - Stale values can be served only when an operation explicitly allows stale
   responses.
 

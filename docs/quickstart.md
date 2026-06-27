@@ -19,7 +19,9 @@ cargo run --bin cachebox -- \
   --bind 127.0.0.1:7400 \
   --max-body-bytes 8388608 \
   --max-memory-bytes 67108864 \
-  --max-value-bytes 8388608
+  --max-value-bytes 8388608 \
+  --cleanup-interval-ms 250 \
+  --cleanup-max-entries-per-tick 128
 ```
 
 Show all options:

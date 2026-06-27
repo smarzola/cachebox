@@ -235,17 +235,23 @@ Start Cachebox with memory and value limits:
 cargo run --bin cachebox -- \
   --max-memory-bytes 67108864 \
   --max-value-bytes 8388608 \
-  --max-body-bytes 8388608
+  --max-body-bytes 8388608 \
+  --cleanup-interval-ms 250 \
+  --cleanup-max-entries-per-tick 128
 ```
 
 Behavior:
 
 - Request bodies over `--max-body-bytes` are rejected.
 - Single values over `--max-value-bytes` are rejected.
+- `--cleanup-interval-ms` controls the background expiration interval. Use `0`
+  to disable the background cleanup worker.
+- `--cleanup-max-entries-per-tick` limits how many expired entries the
+  background worker can reclaim in one tick.
 - Writes evict bounded-sample approximate least-recently-used entries when
   memory is tight.
 - Expired entries are tracked in an expiry index and reclaimed by cache access
-  paths or before live entries are evicted.
+  paths, the bounded background worker, or before live entries are evicted.
 
 ## Health And Metrics
 
