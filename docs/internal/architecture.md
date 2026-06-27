@@ -159,8 +159,8 @@ memory_cost: estimated bytes
 Expiration:
 
 - Lazy expiration on reads and writes.
-- Background expiration pass.
-- TTL lookup should not require scanning the full map.
+- Expiration lookup uses an ordered expiry index, so reclaiming expired values
+  walks expired deadlines instead of scanning the full keyspace.
 - Stale values can be served only when an operation explicitly allows stale
   responses.
 
@@ -194,7 +194,9 @@ Current accounting is intentionally approximate. Each entry counts namespace,
 key, value, tag bytes, and a fixed per-entry overhead. Writes reject a single
 value over `--max-value-bytes`, reject an entry that cannot fit
 `--max-memory-bytes`, reclaim expired entries, and then evict least-recently-used
-live entries until the new value fits.
+live entries until the new value fits. The implementation keeps an ordered
+expiry index and uses bounded-sample approximate LRU for memory-pressure
+eviction, avoiding full-map scans on the hot write path.
 
 ### Observability
 

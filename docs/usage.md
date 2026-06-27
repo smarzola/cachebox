@@ -241,8 +241,10 @@ Behavior:
 
 - Request bodies over `--max-body-bytes` are rejected.
 - Single values over `--max-value-bytes` are rejected.
-- Writes evict approximate least-recently-used entries when memory is tight.
-- Expired entries are reclaimed before live entries are evicted.
+- Writes evict bounded-sample approximate least-recently-used entries when
+  memory is tight.
+- Expired entries are tracked in an expiry index and reclaimed before live
+  entries are evicted.
 
 ## Health And Metrics
 

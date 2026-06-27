@@ -3,12 +3,13 @@
 //! The MVP engine stores byte keys and values with lazy expiration. Networking
 //! and request parsing stay outside this module.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::Ttl;
 
 const ENTRY_OVERHEAD_BYTES: usize = 96;
+const LRU_SAMPLE_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
@@ -36,6 +37,7 @@ where
     entries: HashMap<EntryId, Entry>,
     leases: HashMap<EntryId, Lease>,
     tag_index: HashMap<TagId, HashSet<EntryId>>,
+    expiry_index: BTreeSet<ExpiryKey>,
     limits: EngineLimits,
     memory_used_bytes: usize,
     cost_score_total: u64,
@@ -73,6 +75,7 @@ where
             entries: HashMap::new(),
             leases: HashMap::new(),
             tag_index: HashMap::new(),
+            expiry_index: BTreeSet::new(),
             limits,
             memory_used_bytes: 0,
             cost_score_total: 0,
@@ -139,6 +142,12 @@ where
         }
 
         let last_access = self.bump_access();
+        if let Some(removable_at_ms) = removable_at_ms(expires_at_ms, stale_until_ms) {
+            self.expiry_index.insert(ExpiryKey {
+                expires_at_ms: removable_at_ms,
+                id: id.clone(),
+            });
+        }
         self.entries.insert(
             id,
             Entry {
@@ -160,31 +169,27 @@ where
 
     pub fn get(&mut self, namespace: &str, key: &[u8]) -> GetOutcome {
         let id = EntryId::new(namespace, key);
-        match self.entry_state(&id) {
+        let now_ms = self.clock.now_ms();
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return GetOutcome::Miss;
+        };
+        match entry_state_at(entry, now_ms) {
             EntryState::Missing => GetOutcome::Miss,
             EntryState::Expired => {
                 self.remove_entry(&id);
                 GetOutcome::Miss
             }
             EntryState::Fresh => {
-                let access = self.bump_access();
-                self.entries
-                    .get_mut(&id)
-                    .map(|entry| {
-                        entry.last_access = access;
-                        GetOutcome::Hit(entry.value.clone())
-                    })
-                    .unwrap_or(GetOutcome::Miss)
+                let access = self.next_access;
+                self.next_access = self.next_access.saturating_add(1);
+                entry.last_access = access;
+                GetOutcome::Hit(entry.value.clone())
             }
             EntryState::Stale => {
-                let access = self.bump_access();
-                self.entries
-                    .get_mut(&id)
-                    .map(|entry| {
-                        entry.last_access = access;
-                        GetOutcome::Stale(entry.value.clone())
-                    })
-                    .unwrap_or(GetOutcome::Miss)
+                let access = self.next_access;
+                self.next_access = self.next_access.saturating_add(1);
+                entry.last_access = access;
+                GetOutcome::Stale(entry.value.clone())
             }
         }
     }
@@ -227,24 +232,19 @@ where
         let has_active_lease = self.active_lease(&id).is_some();
         match self.entry_state(&id) {
             EntryState::Fresh => {
-                let access = self.bump_access();
-                self.entries
-                    .get_mut(&id)
-                    .map(|entry| {
-                        entry.last_access = access;
-                        StartLeaseOutcome::Hit(entry.value.clone())
-                    })
-                    .unwrap_or(StartLeaseOutcome::LeaseGranted {
+                self.record_access(&id);
+                if let Some(entry) = self.entries.get(&id) {
+                    StartLeaseOutcome::Hit(entry.value.clone())
+                } else {
+                    StartLeaseOutcome::LeaseGranted {
                         token: self.create_lease(&id, lease_ttl_ms),
                         stale_value: None,
-                    })
+                    }
+                }
             }
             EntryState::Stale => {
-                let access = self.bump_access();
-                let stale_value = self.entries.get_mut(&id).map(|entry| {
-                    entry.last_access = access;
-                    entry.value.clone()
-                });
+                self.record_access(&id);
+                let stale_value = self.entries.get(&id).map(|entry| entry.value.clone());
                 if has_active_lease {
                     StartLeaseOutcome::Stale {
                         value: stale_value.unwrap_or_default(),
@@ -327,22 +327,19 @@ where
             return EntryState::Missing;
         };
         let now_ms = self.clock.now_ms();
-
-        match (entry.expires_at_ms, entry.stale_until_ms) {
-            (None, _) => EntryState::Fresh,
-            (Some(expires_at), _) if now_ms <= expires_at => EntryState::Fresh,
-            (Some(_), Some(stale_until)) if now_ms <= stale_until => EntryState::Stale,
-            _ => EntryState::Expired,
-        }
+        entry_state_at(entry, now_ms)
     }
 
     fn remove_expired(&mut self) {
-        let expired: Vec<EntryId> = self
-            .entries
-            .keys()
-            .filter(|id| self.entry_state(id) == EntryState::Expired)
-            .cloned()
-            .collect();
+        let now_ms = self.clock.now_ms();
+        let mut expired = Vec::new();
+        while let Some(key) = self.expiry_index.first().cloned() {
+            if key.expires_at_ms > now_ms {
+                break;
+            }
+            self.expiry_index.remove(&key);
+            expired.push(key.id);
+        }
 
         for id in expired {
             if self.remove_entry(&id) {
@@ -360,6 +357,12 @@ where
         self.cost_score_total = self
             .cost_score_total
             .saturating_sub(entry.cost.unwrap_or(0));
+        if let Some(removable_at_ms) = removable_at_ms(entry.expires_at_ms, entry.stale_until_ms) {
+            self.expiry_index.remove(&ExpiryKey {
+                expires_at_ms: removable_at_ms,
+                id: id.clone(),
+            });
+        }
 
         for tag in entry.tags {
             let tag_id = TagId {
@@ -396,8 +399,19 @@ where
     fn least_recently_used_entry(&self) -> Option<EntryId> {
         self.entries
             .iter()
+            .take(LRU_SAMPLE_SIZE)
             .min_by_key(|(_, entry)| entry.last_access)
             .map(|(id, _)| id.clone())
+    }
+
+    fn record_access(&mut self, id: &EntryId) {
+        if !self.entries.contains_key(id) {
+            return;
+        };
+        let access = self.bump_access();
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.last_access = access;
+        }
     }
 
     fn bump_access(&mut self) -> u64 {
@@ -532,7 +546,7 @@ pub enum GetOutcome {
     Miss,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct EntryId {
     namespace: String,
     key: Vec<u8>,
@@ -545,6 +559,12 @@ impl EntryId {
             key: key.to_vec(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExpiryKey {
+    expires_at_ms: u64,
+    id: EntryId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -584,6 +604,19 @@ fn estimate_entry_memory(id: &EntryId, value: &[u8], tags: &[String]) -> usize {
         .saturating_add(id.key.len())
         .saturating_add(value.len())
         .saturating_add(tags.iter().map(String::len).sum::<usize>())
+}
+
+fn removable_at_ms(expires_at_ms: Option<u64>, stale_until_ms: Option<u64>) -> Option<u64> {
+    stale_until_ms.or(expires_at_ms)
+}
+
+fn entry_state_at(entry: &Entry, now_ms: u64) -> EntryState {
+    match (entry.expires_at_ms, entry.stale_until_ms) {
+        (None, _) => EntryState::Fresh,
+        (Some(expires_at), _) if now_ms <= expires_at => EntryState::Fresh,
+        (Some(_), Some(stale_until)) if now_ms <= stale_until => EntryState::Stale,
+        _ => EntryState::Expired,
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +918,25 @@ mod tests {
 
         assert!(after_small < after_large);
         assert_eq!(engine.get("default", b"k"), GetOutcome::Hit(b"s".to_vec()));
+    }
+
+    #[test]
+    fn replacing_key_cleans_old_expiry_index() {
+        let (mut engine, clock) = engine();
+        let mut expiring = put("default", b"k", b"old");
+        expiring.ttl = Some(Ttl { milliseconds: 10 });
+        engine.put(expiring).expect("expiring value should fit");
+
+        engine
+            .put(put("default", b"k", b"new"))
+            .expect("replacement should fit");
+
+        clock.advance(11);
+        assert_eq!(
+            engine.get("default", b"k"),
+            GetOutcome::Hit(b"new".to_vec())
+        );
+        assert_eq!(engine.stats().expirations, 0);
     }
 
     #[test]
