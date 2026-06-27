@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 const PROMPT_KEY_PREFIX: &[u8] = b"ai:prompt:v1:";
-const NORMALIZATION_VERSION: &[u8] = b"cachebox.ai.prompt.v1";
+const EMBEDDING_KEY_PREFIX: &[u8] = b"ai:embedding:v1:";
+const PROMPT_NORMALIZATION_VERSION: &[u8] = b"cachebox.ai.prompt.v1";
+const EMBEDDING_NORMALIZATION_VERSION: &[u8] = b"cachebox.ai.embedding.v1";
 const FNV_OFFSET_BASIS: u128 = 0x6c62272e07bb014262b821756295c58d;
 const FNV_PRIME: u128 = 0x0000000001000000000000000000013b;
 
@@ -49,6 +51,37 @@ pub struct PromptCacheKeyInput {
     pub application_namespace: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingCacheKeyInput {
+    pub model: String,
+    pub model_version: Option<String>,
+    pub input_content_hash: String,
+    pub normalization_settings: BTreeMap<String, Value>,
+    pub chunking_strategy: String,
+    pub dimensions: u32,
+    pub application_namespace: String,
+}
+
+impl EmbeddingCacheKeyInput {
+    pub fn new(
+        model: impl Into<String>,
+        input_content_hash: impl Into<String>,
+        chunking_strategy: impl Into<String>,
+        dimensions: u32,
+        application_namespace: impl Into<String>,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            model_version: None,
+            input_content_hash: input_content_hash.into(),
+            normalization_settings: BTreeMap::new(),
+            chunking_strategy: chunking_strategy.into(),
+            dimensions,
+            application_namespace: application_namespace.into(),
+        }
+    }
+}
+
 impl PromptCacheKeyInput {
     pub fn new(
         provider: impl Into<String>,
@@ -73,20 +106,30 @@ impl PromptCacheKeyInput {
 pub fn prompt_cache_key(input: &PromptCacheKeyInput) -> Vec<u8> {
     let normalized = normalize_prompt_input(input);
     let digest = fnv1a_128(&normalized);
-    let mut key = PROMPT_KEY_PREFIX.to_vec();
-    write_hex_u128(digest, &mut key);
-    key
+    digest_key(PROMPT_KEY_PREFIX, digest)
+}
+
+pub fn embedding_cache_key(input: &EmbeddingCacheKeyInput) -> Vec<u8> {
+    let normalized = normalize_embedding_input(input);
+    let digest = fnv1a_128(&normalized);
+    digest_key(EMBEDDING_KEY_PREFIX, digest)
 }
 
 pub fn normalize_prompt_input(input: &PromptCacheKeyInput) -> Vec<u8> {
     let mut out = Vec::new();
-    append_bytes(&mut out, b"version", NORMALIZATION_VERSION);
+    append_bytes(&mut out, b"version", PROMPT_NORMALIZATION_VERSION);
     append_str(&mut out, b"provider", &input.provider);
     append_str(&mut out, b"model", &input.model);
     append_optional_str(&mut out, b"model_version", input.model_version.as_deref());
     append_optional_str(&mut out, b"system_prompt", input.system_prompt.as_deref());
     append_json(&mut out, b"tool_schema", input.tool_schema.as_ref());
-    append_sampling_parameters(&mut out, &input.sampling_parameters);
+    append_json_map(
+        &mut out,
+        b"sampling_parameters",
+        b"sampling.name",
+        b"sampling.value",
+        &input.sampling_parameters,
+    );
     append_optional_str(&mut out, b"output_format", input.output_format.as_deref());
     append_optional_str(
         &mut out,
@@ -107,12 +150,41 @@ pub fn normalize_prompt_input(input: &PromptCacheKeyInput) -> Vec<u8> {
     out
 }
 
-fn append_sampling_parameters(out: &mut Vec<u8>, parameters: &BTreeMap<String, Value>) {
-    append_bytes(out, b"sampling_parameters", b"map");
-    append_u64(out, parameters.len() as u64);
-    for (name, value) in parameters {
-        append_str(out, b"sampling.name", name);
-        append_bytes(out, b"sampling.value", canonical_json(value).as_bytes());
+pub fn normalize_embedding_input(input: &EmbeddingCacheKeyInput) -> Vec<u8> {
+    let mut out = Vec::new();
+    append_bytes(&mut out, b"version", EMBEDDING_NORMALIZATION_VERSION);
+    append_str(&mut out, b"model", &input.model);
+    append_optional_str(&mut out, b"model_version", input.model_version.as_deref());
+    append_str(&mut out, b"input_content_hash", &input.input_content_hash);
+    append_json_map(
+        &mut out,
+        b"normalization_settings",
+        b"normalization.name",
+        b"normalization.value",
+        &input.normalization_settings,
+    );
+    append_str(&mut out, b"chunking_strategy", &input.chunking_strategy);
+    append_u64(&mut out, u64::from(input.dimensions));
+    append_str(
+        &mut out,
+        b"application_namespace",
+        &input.application_namespace,
+    );
+    out
+}
+
+fn append_json_map(
+    out: &mut Vec<u8>,
+    field: &[u8],
+    key_field: &[u8],
+    value_field: &[u8],
+    values: &BTreeMap<String, Value>,
+) {
+    append_bytes(out, field, b"map");
+    append_u64(out, values.len() as u64);
+    for (name, value) in values {
+        append_str(out, key_field, name);
+        append_bytes(out, value_field, canonical_json(value).as_bytes());
     }
 }
 
@@ -191,6 +263,12 @@ fn write_hex_u128(value: u128, out: &mut Vec<u8>) {
     }
 }
 
+fn digest_key(prefix: &[u8], digest: u128) -> Vec<u8> {
+    let mut key = prefix.to_vec();
+    write_hex_u128(digest, &mut key);
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +298,24 @@ mod tests {
             .insert("top_p".to_string(), json!(0.95));
         input.output_format = Some("json".to_string());
         input.retrieval_context_hash = Some("sha256:abc123".to_string());
+        input
+    }
+
+    fn base_embedding_input() -> EmbeddingCacheKeyInput {
+        let mut input = EmbeddingCacheKeyInput::new(
+            "text-embedding-example",
+            "sha256:contentabc",
+            "markdown:v1:512:64",
+            1536,
+            "workspace-a",
+        );
+        input.model_version = Some("2026-06-01".to_string());
+        input
+            .normalization_settings
+            .insert("case_fold".to_string(), json!(false));
+        input
+            .normalization_settings
+            .insert("unicode".to_string(), json!("nfc"));
         input
     }
 
@@ -302,5 +398,66 @@ mod tests {
         empty.system_prompt = Some(String::new());
 
         assert_ne!(prompt_cache_key(&missing), prompt_cache_key(&empty));
+    }
+
+    #[test]
+    fn embedding_keys_are_deterministic_for_equivalent_inputs() {
+        let left = base_embedding_input();
+        let mut right = EmbeddingCacheKeyInput::new(
+            "text-embedding-example",
+            "sha256:contentabc",
+            "markdown:v1:512:64",
+            1536,
+            "workspace-a",
+        );
+        right.model_version = Some("2026-06-01".to_string());
+        right
+            .normalization_settings
+            .insert("unicode".to_string(), json!("nfc"));
+        right
+            .normalization_settings
+            .insert("case_fold".to_string(), json!(false));
+
+        assert_eq!(embedding_cache_key(&left), embedding_cache_key(&right));
+        assert_eq!(
+            normalize_embedding_input(&left),
+            normalize_embedding_input(&right)
+        );
+    }
+
+    #[test]
+    fn embedding_keys_change_for_model_input_chunking_and_dimensions() {
+        let original = embedding_cache_key(&base_embedding_input());
+
+        let mut changed_model = base_embedding_input();
+        changed_model.model = "other-embedding-model".to_string();
+        assert_ne!(original, embedding_cache_key(&changed_model));
+
+        let mut changed_input = base_embedding_input();
+        changed_input.input_content_hash = "sha256:contentdef".to_string();
+        assert_ne!(original, embedding_cache_key(&changed_input));
+
+        let mut changed_normalization = base_embedding_input();
+        changed_normalization
+            .normalization_settings
+            .insert("case_fold".to_string(), json!(true));
+        assert_ne!(original, embedding_cache_key(&changed_normalization));
+
+        let mut changed_chunking = base_embedding_input();
+        changed_chunking.chunking_strategy = "markdown:v2:512:64".to_string();
+        assert_ne!(original, embedding_cache_key(&changed_chunking));
+
+        let mut changed_dimensions = base_embedding_input();
+        changed_dimensions.dimensions = 768;
+        assert_ne!(original, embedding_cache_key(&changed_dimensions));
+    }
+
+    #[test]
+    fn embedding_key_output_is_binary_safe_ascii() {
+        let key = embedding_cache_key(&base_embedding_input());
+
+        assert!(key.starts_with(EMBEDDING_KEY_PREFIX));
+        assert_eq!(key.len(), EMBEDDING_KEY_PREFIX.len() + 32);
+        assert!(key.iter().all(u8::is_ascii));
     }
 }

@@ -91,6 +91,10 @@ Metadata:
 Embedding generation is a strong cache candidate because inputs are often
 repeated across indexing, RAG, and local automation workflows.
 
+The Rust crate includes `cachebox::ai::embedding_cache_key`, which builds
+deterministic ASCII byte keys with the prefix `ai:embedding:v1:`. It only builds
+cache keys; it does not perform embedding generation or similarity search.
+
 Cache key inputs:
 
 - Embedding model.
@@ -99,12 +103,24 @@ Cache key inputs:
 - Normalization settings.
 - Chunking strategy.
 - Dimension count.
+- Application namespace.
 
 Stored value:
 
 - Raw embedding bytes.
 - Optional content type for common encodings.
 - Metadata for dimensions, dtype, and model.
+
+Implemented normalization rules:
+
+- The normalized payload starts with the version marker
+  `cachebox.ai.embedding.v1`.
+- Fields are length-prefixed UTF-8 bytes.
+- Normalization setting names are sorted lexicographically.
+- JSON normalization setting values are canonicalized with sorted object keys
+  and compact separators.
+- The final key is the prefix `ai:embedding:v1:` plus a stable 128-bit digest in
+  lowercase hexadecimal.
 
 Non-goal:
 

@@ -45,6 +45,11 @@ PUT and lease completion accept:
   message list, optional system prompt, optional tool schema, sampling
   parameters, optional output format, optional retrieval context hash, and
   application namespace.
+- `cachebox::ai::embedding_cache_key` builds deterministic ASCII byte keys for
+  embedding cache entries.
+- Embedding key normalization includes model, optional model version, input
+  content hash, normalization settings, chunking strategy, dimensions, and
+  application namespace.
 - The helper is provider-neutral and does not call model APIs.
 
 ## Memory
