@@ -99,6 +99,7 @@ docs/
   supported-behavior.md supported and unsupported MVP behavior
   future.md            future product roadmap
   ai-native-cache.md   AI-native cache capabilities
+  ai-native-goal-loop.md AI-native cache implementation loop
   architecture.md      product and system architecture
   mvp-goal-loop.md     implementation prompt and milestone loop
   redis-adapter.md     possible future Redis compatibility layer
@@ -129,4 +130,6 @@ implementation plan is in
 [docs/mvp-goal-loop.md](docs/mvp-goal-loop.md), with completed checkpoints in
 [docs/checkpoints.md](docs/checkpoints.md). Future product direction is tracked
 in [docs/future.md](docs/future.md), with AI-specific cache capabilities broken
-out in [docs/ai-native-cache.md](docs/ai-native-cache.md).
+out in [docs/ai-native-cache.md](docs/ai-native-cache.md). The AI-native
+implementation loop is tracked in
+[docs/ai-native-goal-loop.md](docs/ai-native-goal-loop.md).
