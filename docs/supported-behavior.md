@@ -53,6 +53,8 @@ PUT and lease completion accept:
   application namespace.
 - `cachebox::ai::generation_lease_action` maps lease start states into client
   actions: return cached bytes, generate with a lease token, or retry later.
+- `cachebox::ai::StreamCapture` supports experimental client-side
+  buffer-then-commit capture for streamed generation bytes.
 - The helper is provider-neutral and does not call model APIs.
 
 ## Memory

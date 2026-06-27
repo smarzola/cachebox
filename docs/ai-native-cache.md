@@ -146,6 +146,12 @@ capture streamed chunks in the client, return them to the caller as they arrive,
 and complete the Cachebox lease with one raw-byte value only after generation
 succeeds.
 
+The Rust crate includes `cachebox::ai::StreamCapture` for this conservative
+path. It buffers raw chunks client-side, concatenates them into one value on
+successful completion, and refuses to produce a value after generation is marked
+failed. Cachebox still stores and replays the result as ordinary raw bytes; no
+server-side chunk append protocol exists yet.
+
 Open questions:
 
 - Should partial streams ever be served?

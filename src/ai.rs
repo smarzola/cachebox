@@ -104,6 +104,64 @@ pub enum GenerationCompletionFailure {
     TransportError,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCapture {
+    chunks: Vec<Vec<u8>>,
+    failed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedStream {
+    pub lease_token: String,
+    pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCaptureError {
+    GenerationFailed,
+}
+
+impl StreamCapture {
+    pub fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            failed: false,
+        }
+    }
+
+    pub fn push_chunk(&mut self, chunk: impl Into<Vec<u8>>) {
+        if !self.failed {
+            self.chunks.push(chunk.into());
+        }
+    }
+
+    pub fn mark_failed(&mut self) {
+        self.failed = true;
+        self.chunks.clear();
+    }
+
+    pub fn finish(
+        self,
+        lease_token: impl Into<String>,
+    ) -> Result<CapturedStream, StreamCaptureError> {
+        if self.failed {
+            return Err(StreamCaptureError::GenerationFailed);
+        }
+
+        let value = self.chunks.into_iter().flatten().collect();
+        Ok(CapturedStream {
+            lease_token: lease_token.into(),
+            value,
+        })
+    }
+}
+
+impl Default for StreamCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmbeddingCacheKeyInput {
     pub fn new(
         model: impl Into<String>,
@@ -597,6 +655,52 @@ mod tests {
         assert_eq!(
             generation_completion_success(),
             GenerationCompletion::Completed
+        );
+    }
+
+    #[test]
+    fn stream_capture_commits_concatenated_raw_chunks_after_success() {
+        let mut capture = StreamCapture::new();
+        capture.push_chunk(b"hello ".to_vec());
+        capture.push_chunk(vec![0, 1, 2]);
+        capture.push_chunk(b" world".to_vec());
+
+        let captured = capture.finish("lease-1").expect("capture should finish");
+
+        assert_eq!(
+            captured,
+            CapturedStream {
+                lease_token: "lease-1".to_string(),
+                value: b"hello \x00\x01\x02 world".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn stream_capture_does_not_publish_failed_generations() {
+        let mut capture = StreamCapture::new();
+        capture.push_chunk(b"partial".to_vec());
+        capture.mark_failed();
+        capture.push_chunk(b" ignored".to_vec());
+
+        assert_eq!(
+            capture.finish("lease-1"),
+            Err(StreamCaptureError::GenerationFailed)
+        );
+    }
+
+    #[test]
+    fn stream_capture_replay_bytes_are_deterministic() {
+        let mut first = StreamCapture::new();
+        first.push_chunk(b"a".to_vec());
+        first.push_chunk(b"b".to_vec());
+
+        let mut second = StreamCapture::new();
+        second.push_chunk(b"ab".to_vec());
+
+        assert_eq!(
+            first.finish("lease-1").expect("first capture").value,
+            second.finish("lease-2").expect("second capture").value
         );
     }
 }
