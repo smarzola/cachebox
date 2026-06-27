@@ -298,7 +298,7 @@ Each namespace can define:
 
 The current benchmark harness is `cargo run --bin cachebox-bench`. It measures
 loopback HTTP scenarios and documents local baseline output in
-`docs/benchmarks.md`.
+`docs/internal/benchmarks.md`.
 
 ## Open Design Questions
 

@@ -1,135 +1,176 @@
 # Cachebox
 
-Cachebox is a cache-native server for modern self-hosted applications.
+Cachebox is a self-hosted cache server for applications that need explicit
+cache behavior over a simple HTTP API. It stores raw-byte values, attaches cache
+metadata at write time, coordinates expensive refreshes with leases, invalidates
+related entries with tags, keeps memory bounded, and exposes Prometheus-style
+metrics.
 
-The idea is not to clone Redis. It is to build a fast, focused cache engine with
-the features applications usually reimplement poorly around generic stores:
-stampede protection, stale-while-revalidate, tag invalidation, namespace quotas,
-cost-aware eviction, and simple observability.
+The project is written in Rust and runs as a single binary. The current server
+accepts HTTP/2 cleartext and HTTP/1.1 for local tooling.
 
-The MVP is HTTP/2-first. It should expose a native cache API with raw-byte values
-and structured metadata instead of inheriting Redis protocol constraints. Redis
-compatibility is only a possible future adapter.
+## Design Principles
 
-## Goals
+- **Cache semantics first.** Reads, writes, TTLs, stale windows, tags, leases,
+  memory limits, and metrics are first-class operations.
+- **Raw bytes in the data path.** Values are stored and returned as bytes; JSON
+  is used only for small control envelopes such as batch reads and lease state.
+- **Self-hostable by default.** The binary should be easy to run on a laptop,
+  VPS, homelab machine, or small internal service.
+- **Bounded memory.** Cachebox accounts for approximate entry memory, enforces
+  configured limits, and evicts approximate least-recently-used entries under
+  pressure.
+- **Observable behavior.** Cache outcomes, errors, leases, expirations,
+  evictions, memory, and cost-score metadata are visible through `/metrics`.
+- **Provider-neutral helpers.** AI-oriented helpers build deterministic cache
+  keys and generation flows without calling model providers.
 
-- Run as a single small Rust binary.
-- Be easy to self-host on small VPS and homelab machines.
-- Keep memory bounded by default.
-- Optimize for cache workloads: small keys, mixed small/medium values, TTLs,
-  high concurrency, and predictable tail latency.
-- Provide simple clients through a conventional HTTP API.
-- Support cache-native features Redis does not expose cleanly.
+## Features
 
-## Non-Goals
+- Single `cachebox` server binary.
+- HTTP API for get, put, delete, batch get, tag invalidation, lease start, and
+  lease completion.
+- Percent-encoded byte keys under named namespaces.
+- Raw-byte values.
+- Fresh TTL and stale TTL metadata.
+- Tag-based invalidation.
+- Lease-based stampede protection for expensive recomputation.
+- Approximate memory accounting with max body, max value, and max memory limits.
+- Approximate LRU eviction.
+- Prometheus-style `/metrics`.
+- Reserved `Cachebox-Cost` metadata with live aggregate cost-score metrics.
+- Rust AI helper utilities:
+  - prompt/result cache keys
+  - embedding cache keys
+  - generation lease decisions
+  - buffer-then-commit stream capture
+- Local benchmark harness.
 
-- Being a full Redis replacement.
-- Providing durable database semantics.
-- Supporting Lua, modules, streams, clustering, or general-purpose data
-  structures in the MVP.
-- Implementing Redis/RESP compatibility in the MVP.
-- Hiding cache semantics behind generic data-structure commands.
+## Quickstart
 
-## MVP Shape
+Build:
 
-The MVP should include:
-
-- HTTP/2 API for cache reads, writes, deletes, batches, tag invalidation, and
-  leases.
-- Raw-byte cache values with metadata carried in headers or JSON envelopes.
-- TTL expiration using lazy expiration plus background cleanup.
-- Configurable memory limit.
-- One eviction policy to start: approximate LRU or random eviction.
-- Basic metrics and structured logs.
-- Integration tests driven through an HTTP client.
-- A benchmark harness comparing common cache paths.
-
-## Native API Direction
-
-Cachebox should expose first-class cache operations:
-
-- Lease-based stampede protection.
-- Stale-while-revalidate responses.
-- Cache tags and tag invalidation.
-- Per-namespace quotas.
-- Cost-aware eviction hints.
-- Built-in cache diagnostics.
-
-The planned HTTP server stack is `axum` on `tokio`/Hyper. The current codebase
-defines and tests the API contract before adding the listener dependency.
-
-Example data-plane requests:
-
-```http
-PUT /v1/namespaces/default/keys/user%3A123
-Cachebox-TTL: 300s
-Cachebox-Tags: user:123,org:9
-Content-Type: application/octet-stream
-
-<raw bytes>
+```sh
+cargo build
 ```
 
-```http
-GET /v1/namespaces/default/keys/user%3A123
+Run:
+
+```sh
+cargo run --bin cachebox -- --bind 127.0.0.1:7400
 ```
 
-Example coordination request:
+Store a value:
 
-```http
-POST /v1/namespaces/default/leases/user%3A123
-Content-Type: application/json
+```sh
+curl --http1.1 -i \
+  -X PUT 'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123' \
+  -H 'Cachebox-TTL: 300s' \
+  -H 'Cachebox-Tags: user:123,org:9' \
+  -H 'Cachebox-Cost: 42' \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'cached bytes'
+```
 
-{"lease_ttl_ms":10000,"allow_stale_ms":60000}
+Read it:
+
+```sh
+curl --http1.1 -i \
+  'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123'
+```
+
+Delete it:
+
+```sh
+curl --http1.1 -i \
+  -X DELETE 'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123'
+```
+
+Check metrics:
+
+```sh
+curl --http1.1 'http://127.0.0.1:7400/metrics'
+```
+
+More examples are in [docs/quickstart.md](docs/quickstart.md) and
+[docs/usage.md](docs/usage.md).
+
+## Configuration
+
+```sh
+cargo run --bin cachebox -- \
+  --bind 127.0.0.1:7400 \
+  --max-body-bytes 8388608 \
+  --max-memory-bytes 67108864 \
+  --max-value-bytes 8388608
+```
+
+Show all options:
+
+```sh
+cargo run --bin cachebox -- --help
+```
+
+## Benchmarks
+
+Run the local benchmark harness:
+
+```sh
+cargo run --bin cachebox-bench
+```
+
+The harness covers cached hits, unique writes, batch reads, lease contention,
+tag invalidation, TTL-heavy writes, eviction pressure, and cost-shaped writes.
+Current baseline output and scenario descriptions are in
+[docs/benchmarks.md](docs/benchmarks.md).
+
+## Documentation
+
+User-facing docs:
+
+- [Documentation index](docs/README.md)
+- [Quickstart](docs/quickstart.md)
+- [Usage guide](docs/usage.md)
+- [AI helpers](docs/ai-helpers.md)
+- [Benchmarks](docs/benchmarks.md)
+
+Internal docs:
+
+- [Internal docs](docs/internal/)
+
+## Development
+
+```sh
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+Ignored spawned-binary smoke tests can be run explicitly:
+
+```sh
+cargo test --test spawned_client -- --ignored
 ```
 
 ## Repository Layout
 
 ```text
 src/
-  api.rs               HTTP API route constants and future routing
-  config.rs            no-dependency CLI and startup configuration parsing
-  engine.rs            cache engine boundary
+  ai.rs                AI-oriented helper utilities
+  api.rs               HTTP API route and metadata parsing
+  config.rs            CLI and startup configuration parsing
+  engine.rs            in-memory cache engine
   lib.rs               library module exports
   main.rs              binary entrypoint
-  operation.rs         typed cache operation boundary
-  server.rs            server startup boundary
+  operation.rs         typed cache operation parser
+  server.rs            HTTP server
 docs/
-  checkpoints.md       clean checkpoint notes from the MVP loop
-  benchmarks.md        local benchmark command and baseline
-  supported-behavior.md supported and unsupported MVP behavior
-  future.md            future product roadmap
-  ai-native-cache.md   AI-native cache capabilities
-  ai-native-goal-loop.md AI-native cache implementation loop
-  architecture.md      product and system architecture
-  mvp-goal-loop.md     implementation prompt and milestone loop
-  redis-adapter.md     possible future Redis compatibility layer
+  README.md            documentation index
+  quickstart.md        first-run guide
+  usage.md             user-facing API examples
+  ai-helpers.md        AI helper examples
+  benchmarks.md        benchmark command and baseline
+  internal/            planning, architecture, and historical notes
+tests/
+  spawned_client.rs    spawned-binary smoke tests
 ```
-
-## Development
-
-```sh
-cargo fmt
-cargo test
-cargo run --bin cachebox -- --bind 127.0.0.1:7400 --max-memory-bytes 67108864 --max-value-bytes 8388608
-cargo run --bin cachebox-bench
-cargo run --bin cachebox -- --help
-```
-
-The binary starts the local HTTP server. The API and operation parsers cover MVP
-route shapes, percent-encoded byte keys, PUT metadata headers, typed cache
-operations, raw byte value bodies, and deterministic error envelopes. The
-in-memory engine supports byte values, TTL, stale TTL, deletes, batch get, and
-tag invalidation. Memory is bounded with approximate accounting, a max value
-size, and approximate LRU eviction. `/metrics` exposes Prometheus-style process
-metrics for requests, cache outcomes, errors, memory, expirations, and
-evictions. Lease start and completion provide the first stampede-protection
-path. Benchmark baselines and the reproducible command live in
-[docs/benchmarks.md](docs/benchmarks.md). Supported and unsupported behavior is
-documented in [docs/supported-behavior.md](docs/supported-behavior.md). The
-implementation plan is in
-[docs/mvp-goal-loop.md](docs/mvp-goal-loop.md), with completed checkpoints in
-[docs/checkpoints.md](docs/checkpoints.md). Future product direction is tracked
-in [docs/future.md](docs/future.md), with AI-specific cache capabilities broken
-out in [docs/ai-native-cache.md](docs/ai-native-cache.md). The AI-native
-implementation loop is tracked in
-[docs/ai-native-goal-loop.md](docs/ai-native-goal-loop.md).

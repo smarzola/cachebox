@@ -228,7 +228,7 @@ What works:
 - Each scenario includes warmup and fixed-duration measurement.
 - Output includes p50, p95, p99, throughput, and memory used.
 - Baseline results and the exact command are documented in
-  `docs/benchmarks.md`.
+  `docs/internal/benchmarks.md`.
 
 Deferred:
 
@@ -260,8 +260,8 @@ What works:
 - A spawned-binary HTTP/2 smoke proves `curl --http2-prior-knowledge` can use
   cache operations including put, get, batch get, tag invalidation, lease start,
   lease completion, and delete.
-- `docs/supported-behavior.md` documents supported endpoints and unsupported MVP
-  behavior.
+- `docs/internal/supported-behavior.md` documents supported endpoints and
+  unsupported MVP behavior.
 
 Deferred:
 

@@ -1,28 +1,23 @@
-# Benchmarks
+# Cachebox Benchmarks
 
-Cachebox includes a local loopback benchmark harness for common cache paths.
-Use it to compare changes on the same machine. Do not treat the checked-in
-baseline as a portable performance claim.
+Cachebox benchmark results are local baselines only. Do not treat them as
+portable performance claims without rerunning the command on the target machine.
 
-## Run
+## Command
 
 ```sh
 cargo run --bin cachebox-bench
 ```
 
-The harness starts local Cachebox servers on random loopback ports, warms each
-scenario, measures for a fixed duration, and prints one row per scenario.
+The harness starts loopback HTTP servers on random local ports, performs warmup
+requests, then measures each scenario for a fixed duration. It reports:
 
-## Columns
-
-- `scenario`: benchmark scenario name.
-- `transport`: current harness transport.
-- `iterations`: completed measured operations.
-- `p50_ns`, `p95_ns`, `p99_ns`: sampled latency percentiles.
-- `throughput_ops_s`: measured operations per second.
-- `memory_used_bytes`: `cachebox_memory_used_bytes` after the scenario.
-- `cost_score_total`: `cachebox_cost_score_total` after the scenario.
-- `notes`: short scenario description.
+- `p50_ns`, `p95_ns`, and `p99_ns`: sampled request latency percentiles.
+- `throughput_ops_s`: completed benchmark operations per second.
+- `memory_used_bytes`: `cachebox_memory_used_bytes` from `/metrics` after the
+  scenario.
+- `cost_score_total`: `cachebox_cost_score_total` from `/metrics` after the
+  scenario.
 
 ## Scenarios
 
@@ -36,7 +31,7 @@ scenario, measures for a fixed duration, and prints one row per scenario.
 - `cost_shaped_writes`: writes cheap large values, expensive small values, and
   TTL-bound cost metadata for cost-aware policy experiments.
 
-## Current Local Baseline
+## Baseline
 
 Captured locally with:
 

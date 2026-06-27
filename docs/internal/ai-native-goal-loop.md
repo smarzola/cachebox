@@ -84,7 +84,7 @@ Checkpoint:
 
 Goal:
 
-- Make `docs/ai-native-cache.md` accurately describe which AI-relevant
+- Make `docs/internal/ai-native-cache.md` accurately describe which AI-relevant
   primitives already exist and which remain future work.
 
 Implementation:
