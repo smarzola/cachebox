@@ -6,8 +6,13 @@ use bytes::Bytes;
 use cachebox::api::Ttl;
 use cachebox::config::Config;
 use cachebox::engine::{Engine, GetOutcome, PutCommand};
+use cachebox::protocol::{
+    BatchItem, Command, HEADER_LEN, Metadata, RequestFrame, RequestPayload, ResponsePayload,
+    decode_response_frame, encode_request_frame,
+};
 use cachebox::server;
 use http::Request;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 
@@ -35,6 +40,19 @@ macro_rules! measure_async {
     }};
 }
 
+macro_rules! measure_native_async {
+    ($name:expr, $notes:expr, $body:block) => {{
+        let mut samples = Vec::new();
+        let started = Instant::now();
+        while started.elapsed() < MEASURE_DURATION {
+            let sample_started = Instant::now();
+            $body
+            samples.push(sample_started.elapsed());
+        }
+        summarize($name, "loopback_tcp", $notes, samples, started.elapsed(), 0)
+    }};
+}
+
 fn main() {
     let runtime = Runtime::new().expect("benchmark tokio runtime");
     runtime.block_on(async_main());
@@ -47,8 +65,10 @@ async fn async_main() {
         max_value_bytes: 1024,
         ..Config::default()
     });
+    let native_server = NativeLoopbackServer::start(Config::default());
     let mut client = H2Client::connect(&server.addr).await;
     let mut eviction_client = H2Client::connect(&eviction_server.addr).await;
+    let mut native_client = NativeClient::connect(&native_server.addr).await;
 
     let scenarios = [
         bench_engine_get(),
@@ -64,6 +84,14 @@ async fn async_main() {
         bench_ttl_heavy_writes(&mut client).await,
         bench_eviction_pressure(&mut eviction_client).await,
         bench_cost_shaped_writes(&mut client).await,
+        bench_native_single_key_get(&mut native_client).await,
+        bench_native_single_key_put(&mut native_client).await,
+        bench_native_batch_get(&mut native_client).await,
+        bench_native_lease_contention(&mut native_client).await,
+        bench_native_tag_invalidate_empty(&mut native_client).await,
+        bench_native_tag_invalidate_8(&mut native_client).await,
+        bench_native_tag_invalidation(&mut native_client).await,
+        bench_native_ttl_heavy_writes(&mut native_client).await,
     ];
 
     println!(
@@ -383,6 +411,231 @@ async fn bench_cost_shaped_writes(client: &mut H2Client) -> BenchResult {
     with_metrics(result, client).await
 }
 
+async fn bench_native_single_key_get(client: &mut NativeClient) -> BenchResult {
+    assert_eq!(
+        client
+            .request(
+                Command::Put,
+                native_put_payload(b"get-key", Metadata::default(), b"value")
+            )
+            .await,
+        ResponsePayload::Stored { evicted: 0 }
+    );
+    warmup_async!({
+        assert_eq!(
+            client
+                .request(Command::Get, native_get_payload(b"get-key"))
+                .await,
+            ResponsePayload::Hit(b"value".to_vec())
+        );
+    });
+    measure_native_async!("single_key_get", "cached_hit", {
+        assert_eq!(
+            client
+                .request(Command::Get, native_get_payload(b"get-key"))
+                .await,
+            ResponsePayload::Hit(b"value".to_vec())
+        );
+    })
+}
+
+async fn bench_native_single_key_put(client: &mut NativeClient) -> BenchResult {
+    let mut index = 0usize;
+    warmup_async!({
+        let key = format!("native-put-warmup-{index}");
+        index += 1;
+        assert_eq!(
+            client
+                .request(
+                    Command::Put,
+                    native_put_payload(key.as_bytes(), Metadata::default(), b"value")
+                )
+                .await,
+            ResponsePayload::Stored { evicted: 0 }
+        );
+    });
+    measure_native_async!("single_key_put", "unique_keys", {
+        let key = format!("native-put-{index}");
+        index += 1;
+        assert_eq!(
+            client
+                .request(
+                    Command::Put,
+                    native_put_payload(key.as_bytes(), Metadata::default(), b"value")
+                )
+                .await,
+            ResponsePayload::Stored { evicted: 0 }
+        );
+    })
+}
+
+async fn bench_native_batch_get(client: &mut NativeClient) -> BenchResult {
+    for index in 0..32 {
+        let key = format!("native-batch-{index}");
+        assert_eq!(
+            client
+                .request(
+                    Command::Put,
+                    native_put_payload(key.as_bytes(), Metadata::default(), b"value")
+                )
+                .await,
+            ResponsePayload::Stored { evicted: 0 }
+        );
+    }
+    let keys: Vec<Vec<u8>> = (0..32)
+        .map(|index| format!("native-batch-{index}").into_bytes())
+        .collect();
+    warmup_async!({
+        assert_native_batch_hits(client, &keys).await;
+    });
+    measure_native_async!("batch_get_32", "32_keys", {
+        assert_native_batch_hits(client, &keys).await;
+    })
+}
+
+async fn bench_native_lease_contention(client: &mut NativeClient) -> BenchResult {
+    assert!(matches!(
+        client
+            .request(
+                Command::LeaseStart,
+                RequestPayload::LeaseStart {
+                    namespace: "bench".to_string(),
+                    key: b"native-contention".to_vec(),
+                    lease_ttl_ms: 60_000,
+                    allow_stale_ms: None,
+                },
+            )
+            .await,
+        ResponsePayload::LeaseGranted { .. }
+    ));
+    warmup_async!({
+        assert_eq!(
+            client
+                .request(
+                    Command::LeaseStart,
+                    RequestPayload::LeaseStart {
+                        namespace: "bench".to_string(),
+                        key: b"native-contention".to_vec(),
+                        lease_ttl_ms: 60_000,
+                        allow_stale_ms: None,
+                    },
+                )
+                .await,
+            ResponsePayload::LeaseDenied
+        );
+    });
+    measure_native_async!("lease_contention", "same_missing_key", {
+        assert_eq!(
+            client
+                .request(
+                    Command::LeaseStart,
+                    RequestPayload::LeaseStart {
+                        namespace: "bench".to_string(),
+                        key: b"native-contention".to_vec(),
+                        lease_ttl_ms: 60_000,
+                        allow_stale_ms: None,
+                    },
+                )
+                .await,
+            ResponsePayload::LeaseDenied
+        );
+    })
+}
+
+async fn bench_native_tag_invalidate_empty(client: &mut NativeClient) -> BenchResult {
+    warmup_async!({
+        assert_eq!(
+            client
+                .request(
+                    Command::TagInvalidate,
+                    native_tag_invalidate_payload("empty-tag")
+                )
+                .await,
+            ResponsePayload::Invalidated { removed: 0 }
+        );
+    });
+    measure_native_async!("tag_invalidate_empty", "single_empty_invalidate", {
+        assert_eq!(
+            client
+                .request(
+                    Command::TagInvalidate,
+                    native_tag_invalidate_payload("empty-tag")
+                )
+                .await,
+            ResponsePayload::Invalidated { removed: 0 }
+        );
+    })
+}
+
+async fn bench_native_tag_invalidate_8(client: &mut NativeClient) -> BenchResult {
+    let mut index = 0usize;
+    warmup_async!({
+        let tag = native_put_tagged_values(client, index).await;
+        native_invalidate_tag(client, &tag, 8).await;
+        index += 1;
+    });
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let tag = native_put_tagged_values(client, index).await;
+        index += 1;
+        let sample_started = Instant::now();
+        native_invalidate_tag(client, &tag, 8).await;
+        samples.push(sample_started.elapsed());
+    }
+    let measured_elapsed = total_duration(&samples);
+    summarize(
+        "tag_invalidate_8",
+        "loopback_tcp",
+        "single_invalidate_8_tagged_keys",
+        samples,
+        measured_elapsed,
+        0,
+    )
+}
+
+async fn bench_native_tag_invalidation(client: &mut NativeClient) -> BenchResult {
+    let mut index = 0usize;
+    warmup_async!({
+        native_tag_invalidation_round(client, index).await;
+        index += 1;
+    });
+    measure_native_async!("tag_workflow_put8_invalidate", "8_puts_plus_invalidate", {
+        native_tag_invalidation_round(client, index).await;
+        index += 1;
+    })
+}
+
+async fn bench_native_ttl_heavy_writes(client: &mut NativeClient) -> BenchResult {
+    let mut index = 0usize;
+    warmup_async!({
+        let key = format!("native-ttl-warmup-{index}");
+        index += 1;
+        assert_eq!(
+            client
+                .request(
+                    Command::Put,
+                    native_put_payload(key.as_bytes(), ttl_metadata(), b"value")
+                )
+                .await,
+            ResponsePayload::Stored { evicted: 0 }
+        );
+    });
+    measure_native_async!("ttl_heavy_writes", "ttl_and_stale_ttl", {
+        let key = format!("native-ttl-{index}");
+        index += 1;
+        assert_eq!(
+            client
+                .request(
+                    Command::Put,
+                    native_put_payload(key.as_bytes(), ttl_metadata(), b"value")
+                )
+                .await,
+            ResponsePayload::Stored { evicted: 0 }
+        );
+    })
+}
+
 async fn tag_invalidation_round(client: &mut H2Client, index: usize) {
     let tag = put_tagged_values(client, index).await;
     invalidate_tag(client, &tag).await;
@@ -448,6 +701,96 @@ async fn cost_shaped_round(client: &mut H2Client, index: usize) {
     ];
     for (path, headers, body) in writes {
         assert_status(client.request("PUT", &path, &headers, body).await, 201);
+    }
+}
+
+async fn assert_native_batch_hits(client: &mut NativeClient, keys: &[Vec<u8>]) {
+    let response = client
+        .request(
+            Command::BatchGet,
+            RequestPayload::BatchGet {
+                namespace: "bench".to_string(),
+                keys: keys.to_vec(),
+            },
+        )
+        .await;
+    assert_eq!(
+        response,
+        ResponsePayload::BatchGet {
+            items: vec![BatchItem::Hit(b"value".to_vec()); keys.len()]
+        }
+    );
+}
+
+async fn native_tag_invalidation_round(client: &mut NativeClient, index: usize) {
+    let tag = native_put_tagged_values(client, index).await;
+    native_invalidate_tag(client, &tag, 8).await;
+}
+
+async fn native_put_tagged_values(client: &mut NativeClient, index: usize) -> String {
+    let tag = format!("native-tag-{index}");
+    for item in 0..8 {
+        let key = format!("native-tag-{index}-{item}");
+        let metadata = Metadata {
+            tags: vec![tag.clone()],
+            ..Metadata::default()
+        };
+        assert_eq!(
+            client
+                .request(
+                    Command::Put,
+                    native_put_payload(key.as_bytes(), metadata, b"value")
+                )
+                .await,
+            ResponsePayload::Stored { evicted: 0 }
+        );
+    }
+    tag
+}
+
+async fn native_invalidate_tag(client: &mut NativeClient, tag: &str, expected_removed: u32) {
+    assert_eq!(
+        client
+            .request(Command::TagInvalidate, native_tag_invalidate_payload(tag))
+            .await,
+        ResponsePayload::Invalidated {
+            removed: expected_removed
+        }
+    );
+}
+
+fn native_get_payload(key: &[u8]) -> RequestPayload {
+    RequestPayload::Get {
+        namespace: "bench".to_string(),
+        key: key.to_vec(),
+    }
+}
+
+fn native_put_payload(key: &[u8], metadata: Metadata, value: &[u8]) -> RequestPayload {
+    RequestPayload::Put {
+        namespace: "bench".to_string(),
+        key: key.to_vec(),
+        metadata,
+        value: value.to_vec(),
+    }
+}
+
+fn native_tag_invalidate_payload(tag: &str) -> RequestPayload {
+    RequestPayload::TagInvalidate {
+        namespace: "bench".to_string(),
+        tag: tag.to_string(),
+    }
+}
+
+fn ttl_metadata() -> Metadata {
+    Metadata {
+        ttl: Some(Ttl {
+            milliseconds: 60_000,
+        }),
+        stale_ttl: Some(Ttl {
+            milliseconds: 60_000,
+        }),
+        ..Metadata::default()
     }
 }
 
@@ -568,6 +911,100 @@ impl LoopbackServer {
         });
 
         Self { addr }
+    }
+}
+
+struct NativeLoopbackServer {
+    addr: String,
+}
+
+impl NativeLoopbackServer {
+    fn start(config: Config) -> Self {
+        let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("native loopback bind");
+        std_listener
+            .set_nonblocking(true)
+            .expect("native nonblocking listener");
+        let addr = std_listener
+            .local_addr()
+            .expect("native local addr")
+            .to_string();
+
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_io()
+                .build()
+                .expect("native tokio runtime");
+            runtime.block_on(async move {
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("native listener");
+                server::serve_native_tcp(listener, &config)
+                    .await
+                    .expect("native loopback server");
+            });
+        });
+
+        Self { addr }
+    }
+}
+
+struct NativeClient {
+    stream: TcpStream,
+    next_request_id: u64,
+}
+
+impl NativeClient {
+    async fn connect(addr: &str) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    return Self {
+                        stream,
+                        next_request_id: 1,
+                    };
+                }
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("benchmark native client did not connect: {error}"),
+            }
+        }
+    }
+
+    async fn request(&mut self, command: Command, payload: RequestPayload) -> ResponsePayload {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        let frame = RequestFrame {
+            request_id,
+            command,
+            payload,
+        };
+        self.stream
+            .write_all(&encode_request_frame(&frame))
+            .await
+            .expect("native write");
+
+        let mut header = [0u8; HEADER_LEN];
+        self.stream
+            .read_exact(&mut header)
+            .await
+            .expect("native response header");
+        let payload_len =
+            u32::from_be_bytes(header[16..20].try_into().expect("header payload length")) as usize;
+        let mut response = Vec::with_capacity(HEADER_LEN + payload_len);
+        response.extend_from_slice(&header);
+        let start = response.len();
+        response.resize(HEADER_LEN + payload_len, 0);
+        self.stream
+            .read_exact(&mut response[start..])
+            .await
+            .expect("native response payload");
+
+        let response =
+            decode_response_frame(&response, usize::MAX).expect("native response should decode");
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.command, command);
+        response.payload
     }
 }
 

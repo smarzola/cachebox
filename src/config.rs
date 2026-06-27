@@ -11,6 +11,7 @@ const DEFAULT_CLEANUP_MAX_ENTRIES_PER_TICK: usize = 128;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub bind_addr: SocketAddr,
+    pub native_bind_addr: Option<SocketAddr>,
     pub max_body_bytes: usize,
     pub max_memory_bytes: usize,
     pub max_value_bytes: usize,
@@ -24,6 +25,7 @@ impl Default for Config {
             bind_addr: DEFAULT_BIND_ADDR
                 .parse()
                 .expect("default bind address must be valid"),
+            native_bind_addr: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
@@ -39,6 +41,7 @@ pub enum ConfigError {
     MissingValue { flag: String },
     UnknownArgument { argument: String },
     InvalidBindAddress { value: String },
+    InvalidNativeBindAddress { value: String },
     InvalidMaxBodyBytes { value: String },
     InvalidMaxMemoryBytes { value: String },
     InvalidMaxValueBytes { value: String },
@@ -54,6 +57,9 @@ impl fmt::Display for ConfigError {
             Self::UnknownArgument { argument } => write!(f, "unknown argument: {argument}"),
             Self::InvalidBindAddress { value } => {
                 write!(f, "invalid bind address: {value}")
+            }
+            Self::InvalidNativeBindAddress { value } => {
+                write!(f, "invalid native bind address: {value}")
             }
             Self::InvalidMaxBodyBytes { value } => {
                 write!(f, "invalid max body byte limit: {value}")
@@ -96,6 +102,19 @@ impl Config {
                         value.parse().map_err(|_| ConfigError::InvalidBindAddress {
                             value: value.clone(),
                         })?;
+                }
+                "--native-bind" => {
+                    let value = args.next().ok_or_else(|| ConfigError::MissingValue {
+                        flag: argument.clone(),
+                    })?;
+                    config.native_bind_addr =
+                        Some(
+                            value
+                                .parse()
+                                .map_err(|_| ConfigError::InvalidNativeBindAddress {
+                                    value: value.clone(),
+                                })?,
+                        );
                 }
                 "--max-body-bytes" => {
                     config.max_body_bytes = parse_nonzero_usize(&argument, args.next(), |value| {
@@ -165,12 +184,15 @@ pub fn help_text(program_name: &str) -> String {
 Cachebox cache server
 
 Usage:
-  {program_name} [--bind <addr:port>] [--max-body-bytes <bytes>] [--max-memory-bytes <bytes>] [--max-value-bytes <bytes>] [--cleanup-interval-ms <ms>] [--cleanup-max-entries-per-tick <count>]
+  {program_name} [--bind <addr:port>] [--native-bind <addr:port>] [--max-body-bytes <bytes>] [--max-memory-bytes <bytes>] [--max-value-bytes <bytes>] [--cleanup-interval-ms <ms>] [--cleanup-max-entries-per-tick <count>]
   {program_name} --help
 
 Options:
   --bind <addr:port>  Address for the HTTP server to bind.
                       Default: {DEFAULT_BIND_ADDR}
+  --native-bind <addr:port>
+                      Address for the native TCP data-plane listener.
+                      Disabled unless provided.
   --max-body-bytes    Maximum accepted request body size.
                       Default: {DEFAULT_MAX_BODY_BYTES}
   --max-memory-bytes  Maximum estimated in-memory cache size.
@@ -198,6 +220,7 @@ mod tests {
         let config = Config::from_args(Vec::<String>::new()).expect("default config");
 
         assert_eq!(config.bind_addr.to_string(), DEFAULT_BIND_ADDR);
+        assert_eq!(config.native_bind_addr, None);
         assert_eq!(config.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
         assert_eq!(config.max_memory_bytes, DEFAULT_MAX_MEMORY_BYTES);
         assert_eq!(config.max_value_bytes, DEFAULT_MAX_VALUE_BYTES);
@@ -210,9 +233,15 @@ mod tests {
 
     #[test]
     fn parses_bind_address() {
-        let config = Config::from_args(["--bind", "0.0.0.0:9000"]).expect("custom config");
+        let config =
+            Config::from_args(["--bind", "0.0.0.0:9000", "--native-bind", "127.0.0.1:9001"])
+                .expect("custom config");
 
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:9000");
+        assert_eq!(
+            config.native_bind_addr.map(|addr| addr.to_string()),
+            Some("127.0.0.1:9001".to_string())
+        );
     }
 
     #[test]
@@ -235,6 +264,15 @@ mod tests {
             error,
             ConfigError::InvalidBindAddress {
                 value: "not-an-address".to_string()
+            }
+        );
+
+        let native_error =
+            Config::from_args(["--native-bind", "nope"]).expect_err("invalid address");
+        assert_eq!(
+            native_error,
+            ConfigError::InvalidNativeBindAddress {
+                value: "nope".to_string()
             }
         );
     }

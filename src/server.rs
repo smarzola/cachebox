@@ -12,7 +12,8 @@ use axum::http::{Method as HttpMethod, StatusCode as HttpStatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::any};
 use serde::Serialize;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
@@ -23,10 +24,16 @@ use crate::engine::{
     PutError, StartLeaseOutcome,
 };
 use crate::operation::{Operation, OperationError, RequestParts, parse_operation};
+use crate::protocol::{
+    BatchItem, Command, DecodeError, ErrorCode, HEADER_LEN, Metadata as NativeMetadata,
+    RequestFrame, RequestPayload, ResponseFrame, ResponsePayload, decode_request_frame,
+    encode_response_frame,
+};
 
 #[derive(Debug, Clone)]
 pub struct StartupReport {
     pub bind_addr: String,
+    pub native_bind_addr: Option<String>,
     pub max_body_bytes: usize,
     pub max_memory_bytes: usize,
     pub max_value_bytes: usize,
@@ -111,6 +118,7 @@ struct MetricsSnapshot {
 pub fn startup_report(config: &Config) -> StartupReport {
     StartupReport {
         bind_addr: config.bind_addr.to_string(),
+        native_bind_addr: config.native_bind_addr.map(|addr| addr.to_string()),
         max_body_bytes: config.max_body_bytes,
         max_memory_bytes: config.max_memory_bytes,
         max_value_bytes: config.max_value_bytes,
@@ -123,6 +131,15 @@ pub fn app(config: &Config) -> Router {
     app_with_state(AppState::from_config(config))
 }
 
+pub async fn serve_native_tcp(listener: TcpListener, config: &Config) -> std::io::Result<()> {
+    run_native_tcp_listener(
+        listener,
+        AppState::from_config(config),
+        config.max_body_bytes,
+    )
+    .await
+}
+
 fn app_with_state(state: AppState) -> Router {
     Router::new()
         .fallback(any(handle_request))
@@ -133,7 +150,11 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     let local_addr = listener.local_addr()?;
     println!(
-        "event=server_start bind_addr={local_addr} max_body_bytes={} max_memory_bytes={} max_value_bytes={} cleanup_interval_ms={} cleanup_max_entries_per_tick={}",
+        "event=server_start bind_addr={local_addr} native_bind_addr={} max_body_bytes={} max_memory_bytes={} max_value_bytes={} cleanup_interval_ms={} cleanup_max_entries_per_tick={}",
+        config
+            .native_bind_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
         config.max_body_bytes,
         config.max_memory_bytes,
         config.max_value_bytes,
@@ -142,6 +163,17 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     );
 
     let state = AppState::from_config(&config);
+    let native_listener = match config.native_bind_addr {
+        Some(addr) => Some(TcpListener::bind(addr).await?),
+        None => None,
+    };
+    let native_task = native_listener.map(|listener| {
+        tokio::spawn(run_native_tcp_listener(
+            listener,
+            state.clone(),
+            config.max_body_bytes,
+        ))
+    });
     let cleanup_task = spawn_expiration_worker(
         Arc::clone(&state.engine),
         config.cleanup_interval_ms,
@@ -154,6 +186,9 @@ pub async fn run(config: Config) -> std::io::Result<()> {
 
     if let Some(cleanup_task) = cleanup_task {
         cleanup_task.abort();
+    }
+    if let Some(native_task) = native_task {
+        native_task.abort();
     }
 
     result
@@ -184,6 +219,59 @@ fn spawn_expiration_worker(
                 .reclaim_expired_budget(max_entries_per_tick);
         }
     }))
+}
+
+async fn run_native_tcp_listener(
+    listener: TcpListener,
+    state: AppState,
+    max_payload_len: usize,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _ = handle_native_tcp_connection(stream, state, max_payload_len).await;
+        });
+    }
+}
+
+async fn handle_native_tcp_connection(
+    mut stream: TcpStream,
+    state: AppState,
+    max_payload_len: usize,
+) -> std::io::Result<()> {
+    loop {
+        let mut header = [0; HEADER_LEN];
+        match stream.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        }
+
+        let payload_len =
+            u32::from_be_bytes(header[16..20].try_into().expect("slice length")) as usize;
+        if payload_len > max_payload_len {
+            return Ok(());
+        }
+
+        let mut frame = Vec::with_capacity(HEADER_LEN + payload_len);
+        frame.extend_from_slice(&header);
+        let start = frame.len();
+        frame.resize(HEADER_LEN + payload_len, 0);
+        stream.read_exact(&mut frame[start..]).await?;
+
+        let request = match decode_request_frame(&frame, max_payload_len) {
+            Ok(request) => request,
+            Err(error) => {
+                if let Some(response) = native_decode_error_response(&frame, error) {
+                    stream.write_all(&encode_response_frame(&response)).await?;
+                }
+                return Ok(());
+            }
+        };
+        let response = execute_native_request(&state, request);
+        stream.write_all(&encode_response_frame(&response)).await?;
+    }
 }
 
 async fn handle_request(
@@ -416,6 +504,249 @@ fn execute_operation(state: AppState, operation: Operation) -> Response {
                 }
             }
         }
+    }
+}
+
+fn execute_native_request(state: &AppState, frame: RequestFrame) -> ResponseFrame {
+    let payload = match frame.payload {
+        RequestPayload::Get { namespace, key } => {
+            state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
+            match state
+                .engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .get(&namespace, &key)
+            {
+                GetOutcome::Hit(value) => {
+                    state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+                    ResponsePayload::Hit(value)
+                }
+                GetOutcome::Stale(value) => {
+                    state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+                    ResponsePayload::Stale(value)
+                }
+                GetOutcome::Miss => {
+                    state.metrics.misses_total.fetch_add(1, Ordering::Relaxed);
+                    ResponsePayload::Miss
+                }
+            }
+        }
+        RequestPayload::Put {
+            namespace,
+            key,
+            metadata,
+            value,
+        } => {
+            state.metrics.put_requests.fetch_add(1, Ordering::Relaxed);
+            match state
+                .engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .put(native_put_command(namespace, key, metadata, value))
+            {
+                Ok(outcome) => ResponsePayload::Stored {
+                    evicted: outcome.evicted.min(u32::MAX as usize) as u32,
+                },
+                Err(error) => {
+                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    native_put_error(error)
+                }
+            }
+        }
+        RequestPayload::Delete { namespace, key } => {
+            state
+                .metrics
+                .delete_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let removed = state
+                .engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .delete(&namespace, &key);
+            ResponsePayload::Deleted { removed }
+        }
+        RequestPayload::BatchGet { namespace, keys } => {
+            state
+                .metrics
+                .batch_get_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let outcomes = state
+                .engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .batch_get(&namespace, &keys);
+            let mut items = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                match outcome {
+                    GetOutcome::Hit(value) => {
+                        state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+                        items.push(BatchItem::Hit(value));
+                    }
+                    GetOutcome::Stale(value) => {
+                        state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+                        items.push(BatchItem::Stale(value));
+                    }
+                    GetOutcome::Miss => {
+                        state.metrics.misses_total.fetch_add(1, Ordering::Relaxed);
+                        items.push(BatchItem::Miss);
+                    }
+                }
+            }
+            ResponsePayload::BatchGet { items }
+        }
+        RequestPayload::TagInvalidate { namespace, tag } => {
+            state
+                .metrics
+                .tag_invalidate_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let removed = state
+                .engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .invalidate_tag(&namespace, &tag);
+            ResponsePayload::Invalidated {
+                removed: removed.min(u32::MAX as usize) as u32,
+            }
+        }
+        RequestPayload::LeaseStart {
+            namespace,
+            key,
+            lease_ttl_ms,
+            allow_stale_ms: _,
+        } => {
+            match state
+                .engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .start_lease(&namespace, &key, lease_ttl_ms)
+            {
+                StartLeaseOutcome::Hit(value) => {
+                    state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+                    ResponsePayload::Hit(value)
+                }
+                StartLeaseOutcome::Stale { value } => {
+                    state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+                    ResponsePayload::Stale(value)
+                }
+                StartLeaseOutcome::LeaseGranted { token, stale_value } => {
+                    state.metrics.lease_grants.fetch_add(1, Ordering::Relaxed);
+                    ResponsePayload::LeaseGranted {
+                        lease_token: token,
+                        stale_value,
+                    }
+                }
+                StartLeaseOutcome::LeaseDenied => {
+                    state.metrics.lease_denials.fetch_add(1, Ordering::Relaxed);
+                    ResponsePayload::LeaseDenied
+                }
+            }
+        }
+        RequestPayload::LeaseComplete {
+            namespace,
+            key,
+            lease_token,
+            metadata,
+            value,
+        } => {
+            let command = CompleteLeaseCommand {
+                namespace,
+                key,
+                lease_token,
+                value,
+                ttl: metadata.ttl,
+                stale_ttl: metadata.stale_ttl,
+                tags: metadata.tags,
+                cost: metadata.cost,
+            };
+            match state
+                .engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .complete_lease(command)
+            {
+                Ok(outcome) => ResponsePayload::Stored {
+                    evicted: outcome.evicted.min(u32::MAX as usize) as u32,
+                },
+                Err(CompleteLeaseError::InvalidLeaseToken) => {
+                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    ResponsePayload::Error {
+                        code: ErrorCode::InvalidLeaseToken,
+                        message: "lease token is missing, expired, or no longer active".to_string(),
+                    }
+                }
+                Err(CompleteLeaseError::Put(error)) => {
+                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    native_put_error(error)
+                }
+            }
+        }
+    };
+
+    ResponseFrame {
+        request_id: frame.request_id,
+        command: frame.command,
+        payload,
+    }
+}
+
+fn native_put_command(
+    namespace: String,
+    key: Vec<u8>,
+    metadata: NativeMetadata,
+    value: Vec<u8>,
+) -> PutCommand {
+    PutCommand {
+        namespace,
+        key,
+        value,
+        ttl: metadata.ttl,
+        stale_ttl: metadata.stale_ttl,
+        tags: metadata.tags,
+        cost: metadata.cost,
+    }
+}
+
+fn native_put_error(error: PutError) -> ResponsePayload {
+    match error {
+        PutError::ValueTooLarge { .. } => ResponsePayload::Error {
+            code: ErrorCode::ValueTooLarge,
+            message: "value exceeds configured value limit".to_string(),
+        },
+        PutError::ValueTooLargeForMemory { .. } => ResponsePayload::Error {
+            code: ErrorCode::EntryTooLarge,
+            message: "entry cannot fit configured memory limit".to_string(),
+        },
+        PutError::InsufficientMemory { .. } => ResponsePayload::Error {
+            code: ErrorCode::InsufficientMemory,
+            message: "entry could not fit after cleanup and eviction".to_string(),
+        },
+    }
+}
+
+fn native_decode_error_response(frame: &[u8], error: DecodeError) -> Option<ResponseFrame> {
+    if frame.len() < HEADER_LEN || frame[0..4] != crate::protocol::MAGIC {
+        return None;
+    }
+    let command = Command::from_id(frame[6]).unwrap_or(Command::Get);
+    let request_id = u64::from_be_bytes(frame[8..16].try_into().ok()?);
+    Some(ResponseFrame {
+        request_id,
+        command,
+        payload: ResponsePayload::Error {
+            code: native_decode_error_code(&error),
+            message: format!("{error:?}"),
+        },
+    })
+}
+
+fn native_decode_error_code(error: &DecodeError) -> ErrorCode {
+    match error {
+        DecodeError::UnsupportedVersion(_) => ErrorCode::UnsupportedVersion,
+        DecodeError::UnknownCommand(_) => ErrorCode::UnknownCommand,
+        DecodeError::FrameTooLarge { .. } => ErrorCode::FrameTooLarge,
+        DecodeError::InvalidNamespace => ErrorCode::InvalidNamespace,
+        DecodeError::InvalidTag => ErrorCode::InvalidTag,
+        _ => ErrorCode::BadFrame,
     }
 }
 
@@ -688,6 +1019,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::protocol::{
+        Metadata, RequestFrame as NativeRequestFrame, ResponseFrame as NativeResponseFrame,
+        VERSION, decode_response_frame, encode_request_frame,
+    };
 
     async fn response_bytes(response: Response) -> Vec<u8> {
         response
@@ -697,6 +1032,45 @@ mod tests {
             .expect("body should collect")
             .to_bytes()
             .to_vec()
+    }
+
+    async fn native_test_client() -> (TcpStream, JoinHandle<std::io::Result<()>>) {
+        let state = AppState::from_config(&Config::default());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("native test listener");
+        let addr = listener.local_addr().expect("native test listener addr");
+        let task = tokio::spawn(run_native_tcp_listener(listener, state, 8192));
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("native test connection");
+        (stream, task)
+    }
+
+    async fn native_roundtrip(
+        stream: &mut TcpStream,
+        request: NativeRequestFrame,
+    ) -> NativeResponseFrame {
+        stream
+            .write_all(&encode_request_frame(&request))
+            .await
+            .expect("native request write");
+        let mut header = [0; HEADER_LEN];
+        stream
+            .read_exact(&mut header)
+            .await
+            .expect("native response header");
+        let payload_len =
+            u32::from_be_bytes(header[16..20].try_into().expect("slice length")) as usize;
+        let mut frame = Vec::with_capacity(HEADER_LEN + payload_len);
+        frame.extend_from_slice(&header);
+        let start = frame.len();
+        frame.resize(HEADER_LEN + payload_len, 0);
+        stream
+            .read_exact(&mut frame[start..])
+            .await
+            .expect("native response payload");
+        decode_response_frame(&frame, 8192).expect("native response decode")
     }
 
     #[tokio::test]
@@ -751,6 +1125,275 @@ mod tests {
         let engine = state.engine.lock().expect("engine mutex poisoned");
         assert_eq!(engine.len(), 0);
         assert_eq!(engine.stats().expirations, 3);
+    }
+
+    #[tokio::test]
+    async fn native_tcp_supports_cache_workflow() {
+        let (mut stream, task) = native_test_client().await;
+
+        let put = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 1,
+                command: Command::Put,
+                payload: RequestPayload::Put {
+                    namespace: "default".to_string(),
+                    key: b"k".to_vec(),
+                    metadata: Metadata {
+                        ttl: Some(crate::api::Ttl {
+                            milliseconds: 60_000,
+                        }),
+                        stale_ttl: None,
+                        cost: Some(7),
+                        tags: vec!["group".to_string()],
+                        content_type: crate::api::ContentType::OctetStream,
+                    },
+                    value: b"value".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(put.payload, ResponsePayload::Stored { evicted: 0 });
+
+        let get = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 2,
+                command: Command::Get,
+                payload: RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"k".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(get.payload, ResponsePayload::Hit(b"value".to_vec()));
+
+        let batch = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 3,
+                command: Command::BatchGet,
+                payload: RequestPayload::BatchGet {
+                    namespace: "default".to_string(),
+                    keys: vec![b"k".to_vec(), b"missing".to_vec()],
+                },
+            },
+        )
+        .await;
+        assert_eq!(
+            batch.payload,
+            ResponsePayload::BatchGet {
+                items: vec![BatchItem::Hit(b"value".to_vec()), BatchItem::Miss]
+            }
+        );
+
+        let delete_put = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 4,
+                command: Command::Put,
+                payload: RequestPayload::Put {
+                    namespace: "default".to_string(),
+                    key: b"delete-me".to_vec(),
+                    metadata: Metadata::default(),
+                    value: b"temporary".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(delete_put.payload, ResponsePayload::Stored { evicted: 0 });
+
+        let delete = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 5,
+                command: Command::Delete,
+                payload: RequestPayload::Delete {
+                    namespace: "default".to_string(),
+                    key: b"delete-me".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(delete.payload, ResponsePayload::Deleted { removed: true });
+
+        let deleted_miss = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 6,
+                command: Command::Get,
+                payload: RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"delete-me".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(deleted_miss.payload, ResponsePayload::Miss);
+
+        let invalidate = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 7,
+                command: Command::TagInvalidate,
+                payload: RequestPayload::TagInvalidate {
+                    namespace: "default".to_string(),
+                    tag: "group".to_string(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(
+            invalidate.payload,
+            ResponsePayload::Invalidated { removed: 1 }
+        );
+
+        let miss = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 8,
+                command: Command::Get,
+                payload: RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"k".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(miss.payload, ResponsePayload::Miss);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn native_tcp_returns_protocol_error_for_invalid_frame() {
+        let (mut stream, task) = native_test_client().await;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&crate::protocol::MAGIC);
+        frame.push(VERSION);
+        frame.push(0);
+        frame.push(0xff);
+        frame.push(0);
+        frame.extend_from_slice(&42u64.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+
+        stream.write_all(&frame).await.expect("invalid frame write");
+        let mut header = [0; HEADER_LEN];
+        stream
+            .read_exact(&mut header)
+            .await
+            .expect("native error response header");
+        let payload_len =
+            u32::from_be_bytes(header[16..20].try_into().expect("slice length")) as usize;
+        let mut response = Vec::with_capacity(HEADER_LEN + payload_len);
+        response.extend_from_slice(&header);
+        let start = response.len();
+        response.resize(HEADER_LEN + payload_len, 0);
+        stream
+            .read_exact(&mut response[start..])
+            .await
+            .expect("native error response payload");
+
+        let response = decode_response_frame(&response, 8192).expect("native error decode");
+        assert_eq!(response.request_id, 42);
+        assert_eq!(response.command, Command::Get);
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Error {
+                code: ErrorCode::UnknownCommand,
+                ..
+            }
+        ));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn native_tcp_supports_lease_workflow() {
+        let (mut stream, task) = native_test_client().await;
+
+        let lease = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 1,
+                command: Command::LeaseStart,
+                payload: RequestPayload::LeaseStart {
+                    namespace: "default".to_string(),
+                    key: b"lease-key".to_vec(),
+                    lease_ttl_ms: 60_000,
+                    allow_stale_ms: None,
+                },
+            },
+        )
+        .await;
+        let token = match lease.payload {
+            ResponsePayload::LeaseGranted {
+                lease_token,
+                stale_value,
+            } => {
+                assert_eq!(stale_value, None);
+                lease_token
+            }
+            other => panic!("expected lease grant, got {other:?}"),
+        };
+
+        let denied = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 2,
+                command: Command::LeaseStart,
+                payload: RequestPayload::LeaseStart {
+                    namespace: "default".to_string(),
+                    key: b"lease-key".to_vec(),
+                    lease_ttl_ms: 60_000,
+                    allow_stale_ms: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(denied.payload, ResponsePayload::LeaseDenied);
+
+        let complete = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 3,
+                command: Command::LeaseComplete,
+                payload: RequestPayload::LeaseComplete {
+                    namespace: "default".to_string(),
+                    key: b"lease-key".to_vec(),
+                    lease_token: token,
+                    metadata: Metadata {
+                        ttl: Some(crate::api::Ttl {
+                            milliseconds: 60_000,
+                        }),
+                        ..Metadata::default()
+                    },
+                    value: b"fresh".to_vec(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(complete.payload, ResponsePayload::Stored { evicted: 0 });
+
+        let hit = native_roundtrip(
+            &mut stream,
+            NativeRequestFrame {
+                request_id: 4,
+                command: Command::LeaseStart,
+                payload: RequestPayload::LeaseStart {
+                    namespace: "default".to_string(),
+                    key: b"lease-key".to_vec(),
+                    lease_ttl_ms: 60_000,
+                    allow_stale_ms: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(hit.payload, ResponsePayload::Hit(b"fresh".to_vec()));
+
+        task.abort();
     }
 
     #[tokio::test]

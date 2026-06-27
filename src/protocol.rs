@@ -37,7 +37,7 @@ impl Command {
         }
     }
 
-    fn from_id(id: u8) -> Result<Self, DecodeError> {
+    pub fn from_id(id: u8) -> Result<Self, DecodeError> {
         match id {
             0x01 => Ok(Self::Get),
             0x02 => Ok(Self::Put),
@@ -192,6 +192,23 @@ impl ErrorCode {
             Self::FrameTooLarge => 0x000b,
         }
     }
+
+    fn from_id(id: u16) -> Result<Self, DecodeError> {
+        match id {
+            0x0001 => Ok(Self::BadFrame),
+            0x0002 => Ok(Self::UnsupportedVersion),
+            0x0003 => Ok(Self::UnknownCommand),
+            0x0004 => Ok(Self::InvalidNamespace),
+            0x0005 => Ok(Self::InvalidTag),
+            0x0006 => Ok(Self::InvalidTtl),
+            0x0007 => Ok(Self::ValueTooLarge),
+            0x0008 => Ok(Self::EntryTooLarge),
+            0x0009 => Ok(Self::InsufficientMemory),
+            0x000a => Ok(Self::InvalidLeaseToken),
+            0x000b => Ok(Self::FrameTooLarge),
+            _ => Err(DecodeError::InvalidPayload("unknown error code")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,10 +261,88 @@ pub fn encode_request_frame(frame: &RequestFrame) -> Vec<u8> {
     encode_frame(KIND_REQUEST, frame.command, frame.request_id, &payload)
 }
 
+pub fn decode_response_frame(
+    input: &[u8],
+    max_payload_len: usize,
+) -> Result<ResponseFrame, DecodeError> {
+    let header = decode_header(input, max_payload_len, KIND_RESPONSE)?;
+    let payload_start = HEADER_LEN;
+    let payload_end = payload_start + header.payload_len;
+    if input.len() < payload_end {
+        return Err(DecodeError::TruncatedPayload {
+            expected: payload_end,
+            actual: input.len(),
+        });
+    }
+
+    let command = Command::from_id(header.command)?;
+    let mut cursor = Cursor::new(&input[payload_start..payload_end]);
+    let payload = decode_response_payload(command, &mut cursor)?;
+    cursor.expect_empty()?;
+    Ok(ResponseFrame {
+        request_id: header.request_id,
+        command,
+        payload,
+    })
+}
+
 pub fn encode_response_frame(frame: &ResponseFrame) -> Vec<u8> {
     let mut payload = Vec::new();
     encode_response_payload(&frame.payload, &mut payload);
     encode_frame(KIND_RESPONSE, frame.command, frame.request_id, &payload)
+}
+
+fn decode_response_payload(
+    command: Command,
+    cursor: &mut Cursor<'_>,
+) -> Result<ResponsePayload, DecodeError> {
+    let status = cursor.read_u8()?;
+    match status {
+        0x00 if command == Command::BatchGet => {
+            let item_count = cursor.read_u32()? as usize;
+            let mut items = Vec::with_capacity(item_count);
+            for _ in 0..item_count {
+                items.push(match cursor.read_u8()? {
+                    0x01 => BatchItem::Hit(cursor.read_bytes()?),
+                    0x02 => BatchItem::Stale(cursor.read_bytes()?),
+                    0x03 => BatchItem::Miss,
+                    _ => return Err(DecodeError::InvalidPayload("invalid batch item status")),
+                });
+            }
+            Ok(ResponsePayload::BatchGet { items })
+        }
+        0x00 => Ok(ResponsePayload::Ok),
+        0x01 => Ok(ResponsePayload::Hit(cursor.read_bytes()?)),
+        0x02 => Ok(ResponsePayload::Stale(cursor.read_bytes()?)),
+        0x03 => Ok(ResponsePayload::Miss),
+        0x04 => Ok(ResponsePayload::Stored {
+            evicted: cursor.read_u32()?,
+        }),
+        0x05 => Ok(ResponsePayload::Deleted {
+            removed: cursor.read_bool()?,
+        }),
+        0x06 => Ok(ResponsePayload::Invalidated {
+            removed: cursor.read_u32()?,
+        }),
+        0x07 => {
+            let lease_token = cursor.read_string()?;
+            let stale_value = if cursor.read_bool()? {
+                Some(cursor.read_bytes()?)
+            } else {
+                None
+            };
+            Ok(ResponsePayload::LeaseGranted {
+                lease_token,
+                stale_value,
+            })
+        }
+        0x08 => Ok(ResponsePayload::LeaseDenied),
+        0xff => Ok(ResponsePayload::Error {
+            code: ErrorCode::from_id(cursor.read_u16()?)?,
+            message: cursor.read_string()?,
+        }),
+        _ => Err(DecodeError::InvalidPayload("unknown response status")),
+    }
 }
 
 fn encode_frame(kind: u8, command: Command, request_id: u64, payload: &[u8]) -> Vec<u8> {

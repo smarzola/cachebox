@@ -12,6 +12,10 @@ async fn main() -> ExitCode {
         Ok(config) => {
             let report = server::startup_report(&config);
             println!("bind_addr={}", report.bind_addr);
+            println!(
+                "native_bind_addr={}",
+                report.native_bind_addr.as_deref().unwrap_or("disabled")
+            );
             println!("max_body_bytes={}", report.max_body_bytes);
             println!("max_memory_bytes={}", report.max_memory_bytes);
             println!("max_value_bytes={}", report.max_value_bytes);
