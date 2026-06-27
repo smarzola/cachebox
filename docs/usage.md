@@ -1,175 +1,221 @@
 # Usage Guide
 
-Cachebox stores raw-byte values under percent-encoded byte keys scoped by an
-ASCII namespace. The API accepts HTTP/2 cleartext.
+Cachebox stores raw-byte values under byte keys scoped by an ASCII namespace.
+Cache operations use the native socket protocol over TCP or Unix sockets.
 
 All examples use:
 
-```sh
-BASE='http://127.0.0.1:7400'
-NS='default'
+```rust
+use cachebox::api::Ttl;
+use cachebox::client::NativeClient;
+use cachebox::protocol::{BatchItem, Metadata, ResponsePayload};
 ```
 
-## Namespaces, Keys, And Encoding
+Connect over the default native TCP listener:
+
+```rust
+let mut client = NativeClient::connect_tcp("127.0.0.1:7401").await?;
+```
+
+Connect over a Unix socket when the server is started with `--native-unix`:
+
+```rust
+let mut client = NativeClient::connect_unix("/tmp/cachebox.sock").await?;
+```
+
+## Namespaces And Keys
 
 Namespaces may contain ASCII letters, numbers, `-`, and `_`.
 
-Keys are path segments and must be percent-encoded when they contain reserved or
-non-printable bytes:
+Keys are bytes. The native protocol does not require percent encoding:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT "$BASE/v1/namespaces/$NS/keys/user%3A123%2Fprofile" \
-  --data-binary 'profile bytes'
-```
-
-This stores the byte key:
-
-```text
-user:123/profile
+```rust
+client
+    .put(
+        "default",
+        b"user:123/profile".to_vec(),
+        Metadata::default(),
+        b"profile bytes".to_vec(),
+    )
+    .await?;
 ```
 
 ## Put
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT "$BASE/v1/namespaces/$NS/keys/dashboard%3A42" \
-  -H 'Content-Type: application/octet-stream' \
-  --data-binary @dashboard.bin
+```rust
+let evicted = client
+    .put(
+        "default",
+        b"dashboard:42".to_vec(),
+        Metadata::default(),
+        std::fs::read("dashboard.bin")?,
+    )
+    .await?;
 ```
 
-`PUT` stores the request body exactly as raw bytes.
+`put` stores the value exactly as raw bytes. It returns the number of entries
+evicted to make room for the write.
 
 ## Get
 
-```sh
-curl --http2-prior-knowledge -i "$BASE/v1/namespaces/$NS/keys/dashboard%3A42"
+```rust
+let response = client.get("default", b"dashboard:42".to_vec()).await?;
+
+match response {
+    ResponsePayload::Hit(bytes) => {
+        assert_eq!(bytes, b"dashboard bytes".to_vec());
+    }
+    ResponsePayload::Stale(bytes) => {
+        let _ = bytes;
+    }
+    ResponsePayload::Miss => {}
+    other => panic!("unexpected get response: {other:?}"),
+}
 ```
 
-Outcomes:
+Get outcomes:
 
-- `200 OK` with `Cachebox-Status: hit` for a fresh value.
-- `200 OK` with `Cachebox-Status: stale` for a stale value.
-- `404 Not Found` with a JSON error envelope for a miss.
-
-Miss response:
-
-```json
-{"code":"cache_miss","message":"cache key was not found"}
-```
+- `Hit(bytes)` for a fresh value.
+- `Stale(bytes)` for a value inside its stale window.
+- `Miss` when no readable value exists.
 
 ## Delete
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X DELETE "$BASE/v1/namespaces/$NS/keys/dashboard%3A42"
+```rust
+let removed = client.delete("default", b"dashboard:42".to_vec()).await?;
 ```
 
-Delete is idempotent and returns `204 No Content`.
+Delete is idempotent. `removed` is `true` only when a stored entry existed.
 
 ## TTL
 
-Use `Cachebox-TTL` to set the fresh lifetime:
+Set the fresh lifetime with `Metadata::ttl`:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT "$BASE/v1/namespaces/$NS/keys/session%3Aabc" \
-  -H 'Cachebox-TTL: 30s' \
-  --data-binary 'session bytes'
-```
-
-Supported TTL units:
-
-- `ms`
-- `s`
-- `m`
-- `h`
-
-Examples:
-
-```text
-100ms
-30s
-5m
-1h
+```rust
+client
+    .put(
+        "default",
+        b"session:abc".to_vec(),
+        Metadata {
+            ttl: Some(Ttl {
+                milliseconds: 30_000,
+            }),
+            ..Metadata::default()
+        },
+        b"session bytes".to_vec(),
+    )
+    .await?;
 ```
 
 ## Stale TTL
 
-Use `Cachebox-Stale-TTL` with `Cachebox-TTL` to keep serving an expired fresh
-value during a stale window:
+Set `stale_ttl` with `ttl` to keep serving an expired fresh value during a stale
+window:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT "$BASE/v1/namespaces/$NS/keys/report%3Aweekly" \
-  -H 'Cachebox-TTL: 60s' \
-  -H 'Cachebox-Stale-TTL: 5m' \
-  --data-binary 'rendered report'
+```rust
+client
+    .put(
+        "default",
+        b"report:weekly".to_vec(),
+        Metadata {
+            ttl: Some(Ttl {
+                milliseconds: 60_000,
+            }),
+            stale_ttl: Some(Ttl {
+                milliseconds: 300_000,
+            }),
+            ..Metadata::default()
+        },
+        b"rendered report".to_vec(),
+    )
+    .await?;
 ```
 
-After the fresh TTL expires, reads can return the old bytes with:
-
-```text
-Cachebox-Status: stale
-```
-
+After the fresh TTL expires, reads can return `ResponsePayload::Stale(bytes)`.
 After the stale TTL expires, the key is treated as a miss.
 
 ## Batch Get
 
-Batch get reads multiple percent-encoded keys from a JSON control body:
+Batch get reads multiple byte keys in one request:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X POST "$BASE/v1/namespaces/$NS/batch/get" \
-  -H 'Content-Type: application/json' \
-  --data '{"keys":["a","user%3A123","bin%00%FF"]}'
+```rust
+let items = client
+    .batch_get(
+        "default",
+        vec![
+            b"a".to_vec(),
+            b"user:123".to_vec(),
+            b"bin\0\xff".to_vec(),
+        ],
+    )
+    .await?;
+
+for item in items {
+    match item {
+        BatchItem::Hit(bytes) => {
+            let _ = bytes;
+        }
+        BatchItem::Stale(bytes) => {
+            let _ = bytes;
+        }
+        BatchItem::Miss => {}
+    }
+}
 ```
 
-The response is JSON. Each item reports hit, stale, or miss state. Hit and stale
-items include `value` as an array of byte values.
-
-Example:
-
-```json
-{"results":[{"status":"hit","value":[118,97,108,117,101]},{"status":"miss","value":null}]}
-```
+Each item reports hit, stale, or miss state.
 
 ## Tags
 
-Tags are comma-separated ASCII labels attached on write:
+Attach tags on write:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT "$BASE/v1/namespaces/$NS/keys/user%3A123%2Fdashboard" \
-  -H 'Cachebox-Tags: user:123,workspace:abc,prompt-template:v2' \
-  --data-binary 'dashboard bytes'
+```rust
+client
+    .put(
+        "default",
+        b"user:123/dashboard".to_vec(),
+        Metadata {
+            tags: vec![
+                "user:123".to_string(),
+                "workspace:abc".to_string(),
+                "prompt-template:v2".to_string(),
+            ],
+            ..Metadata::default()
+        },
+        b"dashboard bytes".to_vec(),
+    )
+    .await?;
 ```
 
 Invalidate all keys in a namespace with a tag:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X POST "$BASE/v1/namespaces/$NS/tags/user%3A123/invalidate"
+```rust
+let removed = client.invalidate_tag("default", "user:123").await?;
 ```
 
-Example response:
-
-```json
-{"removed":3}
-```
+The return value is the number of removed entries.
 
 ## Cost Metadata
 
-`Cachebox-Cost` stores a user-provided unsigned integer score. It is useful for
+`Metadata::cost` stores a user-provided unsigned integer score. It is useful for
 measuring recomputation cost before enabling future cost-aware policy
 experiments:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT "$BASE/v1/namespaces/$NS/keys/llm%3Aanswer" \
-  -H 'Cachebox-Cost: 1200' \
-  --data-binary 'model output'
+```rust
+client
+    .put(
+        "default",
+        b"llm:answer".to_vec(),
+        Metadata {
+            cost: Some(1200),
+            ttl: Some(Ttl {
+                milliseconds: 600_000,
+            }),
+            ..Metadata::default()
+        },
+        b"model output".to_vec(),
+    )
+    .await?;
 ```
 
 The currently accounted aggregate is exposed by `/metrics`. Metrics reads are
@@ -189,40 +235,51 @@ stale key while other clients avoid duplicating the same work.
 
 Start a lease:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X POST "$BASE/v1/namespaces/$NS/leases/prompt%3Aabc" \
-  -H 'Content-Type: application/json' \
-  --data '{"lease_ttl_ms":10000}'
+```rust
+let response = client
+    .start_lease("default", b"prompt:abc".to_vec(), 10_000, None)
+    .await?;
 ```
 
 Possible states:
 
-```json
-{"state":"hit","value":[102,114,101,115,104],"lease_token":null,"stale_value":null}
-```
-
-```json
-{"state":"stale","value":[115,116,97,108,101],"lease_token":null,"stale_value":null}
-```
-
-```json
-{"state":"lease_granted","value":null,"lease_token":"lease-1","stale_value":null}
-```
-
-```json
-{"state":"lease_denied","value":null,"lease_token":null,"stale_value":null}
-```
-
-Complete a granted lease:
-
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT "$BASE/v1/namespaces/$NS/leases/prompt%3Aabc/complete" \
-  -H 'Cachebox-Lease-Token: lease-1' \
-  -H 'Cachebox-TTL: 5m' \
-  -H 'Cachebox-Stale-TTL: 30m' \
-  --data-binary 'fresh generated bytes'
+```rust
+match response {
+    ResponsePayload::Hit(bytes) => {
+        let _ = bytes;
+    }
+    ResponsePayload::Stale(bytes) => {
+        let _ = bytes;
+    }
+    ResponsePayload::LeaseGranted {
+        lease_token,
+        stale_value,
+    } => {
+        let generated = b"fresh generated bytes".to_vec();
+        let _ = stale_value;
+        client
+            .complete_lease(
+                "default",
+                b"prompt:abc".to_vec(),
+                lease_token,
+                Metadata {
+                    ttl: Some(Ttl {
+                        milliseconds: 300_000,
+                    }),
+                    stale_ttl: Some(Ttl {
+                        milliseconds: 1_800_000,
+                    }),
+                    ..Metadata::default()
+                },
+                generated,
+            )
+            .await?;
+    }
+    ResponsePayload::LeaseDenied => {
+        // Another client owns the active lease.
+    }
+    other => panic!("unexpected lease response: {other:?}"),
+}
 ```
 
 Lease state is in-memory and process-local.
@@ -242,7 +299,7 @@ cargo run --bin cachebox -- \
 
 Behavior:
 
-- Request bodies over `--max-body-bytes` are rejected.
+- Native frames with payloads over `--max-body-bytes` are rejected.
 - Single values over `--max-value-bytes` are rejected.
 - `--cleanup-interval-ms` controls the background expiration interval. Use `0`
   to disable the background cleanup worker.
@@ -255,16 +312,18 @@ Behavior:
 
 ## Health And Metrics
 
+Admin HTTP is intentionally separate from the native cache data plane.
+
 Health:
 
 ```sh
-curl --http2-prior-knowledge "$BASE/healthz"
+curl 'http://127.0.0.1:7400/healthz'
 ```
 
 Metrics:
 
 ```sh
-curl --http2-prior-knowledge "$BASE/metrics"
+curl 'http://127.0.0.1:7400/metrics'
 ```
 
 Important metrics:
@@ -284,12 +343,17 @@ cachebox_memory_limit_bytes
 cachebox_cost_score_total
 ```
 
-## Error Envelopes
+## Errors
 
-Application errors use deterministic JSON envelopes:
+The native client returns `ClientError::Server` for structured server errors:
 
-```json
-{"code":"invalid_ttl","message":"Cachebox-TTL has invalid TTL value 'bad'"}
+```rust
+match client.get("bad namespace!", b"k".to_vec()).await {
+    Err(cachebox::client::ClientError::Server { code, message }) => {
+        let _ = (code, message);
+    }
+    other => panic!("unexpected result: {other:?}"),
+}
 ```
 
-The exact `code` field is stable enough for tests and simple clients.
+Protocol error codes are defined in `cachebox::protocol::ErrorCode`.

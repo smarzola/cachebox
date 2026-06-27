@@ -2,7 +2,7 @@
 
 Redis compatibility is not part of the Cachebox MVP.
 
-Cachebox should be built around a native HTTP/2 cache API first. A Redis adapter
+Cachebox should be built around the native socket cache API first. A Redis adapter
 may be useful later for adoption, but it must not shape the cache engine or force
 Redis data-structure semantics into the core design.
 

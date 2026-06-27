@@ -1,6 +1,6 @@
 # Future Product Direction
 
-The MVP proves the core shape: HTTP-first cache operations, raw-byte values,
+The MVP proves the core shape: native socket cache operations, raw-byte values,
 TTL, stale TTL, tag invalidation, memory limits, approximate LRU eviction,
 metrics, and lease-based stampede protection.
 
@@ -109,8 +109,8 @@ eventually a small web UI.
 
 ### Official Clients
 
-The HTTP API keeps third-party client requirements low, but official clients can
-make cache semantics easier to use correctly.
+The native protocol is intentionally compact, but official clients make cache
+semantics easier to use correctly.
 
 Initial client targets:
 
@@ -121,7 +121,7 @@ Initial client targets:
 
 Client responsibilities:
 
-- Percent-encode byte keys correctly.
+- Encode native frames correctly.
 - Carry TTL, stale TTL, tags, and cost hints.
 - Provide ergonomic lease helpers.
 - Support binary values.
@@ -147,16 +147,14 @@ The UI should be optional and read-only by default.
 
 ### Transport Evolution
 
-HTTP/2 is the default transport for the product because it is mature, debuggable,
-and widely supported.
+Native TCP and Unix sockets are the default transports for the product because
+the hot path should avoid HTTP routing, header parsing, and JSON envelopes.
 
 Future transports may include:
 
-- HTTP/3 for lossy networks, edge deployments, or direct internet-facing
-  workloads.
-- Unix domain sockets for same-host deployments.
-- A compact binary batch protocol if HTTP overhead becomes measurable in real
-  benchmarks.
+- Additional official client transports over the same native framing.
+- HTTP admin endpoints for diagnostics.
+- HTTP compatibility adapters only if real adoption needs justify them.
 - A Redis adapter only if real adoption needs justify it.
 
 The cache engine must stay transport-independent so these are adapters, not

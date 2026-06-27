@@ -161,16 +161,35 @@ chunk append protocol.
 
 ## Cost Metadata For AI Workloads
 
-Use `Cachebox-Cost` to record a recomputation score:
+Use native metadata to record a recomputation score:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT "$BASE/v1/namespaces/default/keys/ai%3Aanswer" \
-  -H 'Cachebox-Cost: 1800' \
-  -H 'Cachebox-TTL: 10m' \
-  -H 'Cachebox-Stale-TTL: 1h' \
-  -H 'Cachebox-Tags: model:gpt-example,prompt-template:v3' \
-  --data-binary 'model output bytes'
+```rust
+use cachebox::api::Ttl;
+use cachebox::protocol::Metadata;
+
+let metadata = Metadata {
+    cost: Some(1800),
+    ttl: Some(Ttl {
+        milliseconds: 600_000,
+    }),
+    stale_ttl: Some(Ttl {
+        milliseconds: 3_600_000,
+    }),
+    tags: vec![
+        "model:gpt-example".to_string(),
+        "prompt-template:v3".to_string(),
+    ],
+    ..Metadata::default()
+};
+
+client
+    .put(
+        "default",
+        b"ai:answer".to_vec(),
+        metadata,
+        b"model output bytes".to_vec(),
+    )
+    .await?;
 ```
 
 The currently accounted aggregate cost score is available in Prometheus

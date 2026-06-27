@@ -1,4 +1,4 @@
-//! HTTP server startup and handlers.
+//! Admin HTTP server and native socket data-plane handlers.
 
 use std::io;
 use std::net::SocketAddr;
@@ -9,13 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::Bytes;
 use axum::extract::{OriginalUri, State};
-use axum::http::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{Method as HttpMethod, StatusCode as HttpStatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router, routing::any};
-use serde::Serialize;
+use axum::{Router, routing::any};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(unix)]
@@ -23,13 +21,11 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::api::{ErrorEnvelope, Method, StatusCode};
 use crate::config::Config;
 use crate::engine::{
     CompleteLeaseCommand, CompleteLeaseError, Engine, EngineLimits, GetOutcome, PutCommand,
     PutError, StartLeaseOutcome,
 };
-use crate::operation::{Operation, OperationError, RequestParts, parse_operation};
 use crate::protocol::{
     BatchItem, Command, DecodeError, ErrorCode, HEADER_LEN, Metadata as NativeMetadata,
     RequestFrame, RequestPayload, ResponseFrame, ResponsePayload, decode_request_frame,
@@ -38,7 +34,7 @@ use crate::protocol::{
 
 #[derive(Debug, Clone)]
 pub struct StartupReport {
-    pub bind_addr: String,
+    pub admin_bind_addr: String,
     pub native_bind_addr: Option<String>,
     pub native_unix_socket: Option<String>,
     pub max_body_bytes: usize,
@@ -52,7 +48,6 @@ pub struct StartupReport {
 pub struct AppState {
     engine: Arc<Mutex<Engine>>,
     metrics: Arc<Metrics>,
-    max_body_bytes: usize,
 }
 
 impl AppState {
@@ -63,7 +58,6 @@ impl AppState {
                 max_value_bytes: config.max_value_bytes,
             }))),
             metrics: Arc::new(Metrics::default()),
-            max_body_bytes: config.max_body_bytes,
         }
     }
 }
@@ -124,7 +118,7 @@ struct MetricsSnapshot {
 
 pub fn startup_report(config: &Config) -> StartupReport {
     StartupReport {
-        bind_addr: config.bind_addr.to_string(),
+        admin_bind_addr: config.bind_addr.to_string(),
         native_bind_addr: config.native_bind_addr.map(|addr| addr.to_string()),
         native_unix_socket: config
             .native_unix_socket
@@ -171,7 +165,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     let local_addr = listener.local_addr()?;
     println!(
-        "event=server_start bind_addr={local_addr} native_bind_addr={} native_unix_socket={} max_body_bytes={} max_memory_bytes={} max_value_bytes={} cleanup_interval_ms={} cleanup_max_entries_per_tick={}",
+        "event=server_start admin_bind_addr={local_addr} native_bind_addr={} native_unix_socket={} max_body_bytes={} max_memory_bytes={} max_value_bytes={} cleanup_interval_ms={} cleanup_max_entries_per_tick={}",
         config
             .native_bind_addr
             .map(|addr| addr.to_string())
@@ -382,17 +376,14 @@ async fn handle_request(
     State(state): State<AppState>,
     method: HttpMethod,
     OriginalUri(uri): OriginalUri,
-    headers: HeaderMap,
-    body: Bytes,
 ) -> Response {
     let path = uri.path();
     if method == HttpMethod::GET && path == crate::api::METRICS_ROUTE {
         return metrics_response(&state);
     }
 
-    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-
     if method == HttpMethod::GET && path == crate::api::HEALTH_ROUTE {
+        state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         state
             .metrics
             .health_requests
@@ -400,215 +391,13 @@ async fn handle_request(
         return (HttpStatusCode::OK, "ok").into_response();
     }
 
-    if body.len() > state.max_body_bytes {
-        state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-        return json_error(
-            HttpStatusCode::PAYLOAD_TOO_LARGE,
-            ErrorEnvelope {
-                code: "body_too_large",
-                message: format!("request body exceeds {} byte limit", state.max_body_bytes),
-            },
-        );
-    }
-
-    let Some(method) = convert_method(&method) else {
-        state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-        return json_error(
-            HttpStatusCode::METHOD_NOT_ALLOWED,
-            ErrorEnvelope {
-                code: "method_not_allowed",
-                message: format!("{} is not supported", method.as_str()),
-            },
-        );
-    };
-
-    let header_pairs = header_pairs(&headers);
-    let request = RequestParts {
-        method,
-        path,
-        headers: header_pairs
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect(),
-        body: body.to_vec(),
-    };
-
-    match parse_operation(request) {
-        Ok(operation) => execute_operation(state, operation),
-        Err(error) => {
-            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-            operation_error_response(error)
-        }
-    }
-}
-
-fn execute_operation(state: AppState, operation: Operation) -> Response {
-    match operation {
-        Operation::Get { namespace, key } => {
-            state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
-            let outcome = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .get(&namespace, &key);
-            match &outcome {
-                GetOutcome::Hit(_) => state.metrics.hits_total.fetch_add(1, Ordering::Relaxed),
-                GetOutcome::Stale(_) => state.metrics.stale_total.fetch_add(1, Ordering::Relaxed),
-                GetOutcome::Miss => state.metrics.misses_total.fetch_add(1, Ordering::Relaxed),
-            };
-            get_response(outcome)
-        }
-        Operation::Put {
-            namespace,
-            key,
-            value,
-            metadata,
-        } => {
-            state.metrics.put_requests.fetch_add(1, Ordering::Relaxed);
-            let result = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .put(PutCommand {
-                    namespace,
-                    key,
-                    value,
-                    ttl: metadata.ttl,
-                    stale_ttl: metadata.stale_ttl,
-                    tags: metadata.tags,
-                    cost: metadata.cost,
-                });
-            match result {
-                Ok(_) => HttpStatusCode::CREATED.into_response(),
-                Err(error) => {
-                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                    put_error_response(error)
-                }
-            }
-        }
-        Operation::Delete { namespace, key } => {
-            state
-                .metrics
-                .delete_requests
-                .fetch_add(1, Ordering::Relaxed);
-            state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .delete(&namespace, &key);
-            HttpStatusCode::NO_CONTENT.into_response()
-        }
-        Operation::BatchGet { namespace, keys } => {
-            state
-                .metrics
-                .batch_get_requests
-                .fetch_add(1, Ordering::Relaxed);
-            let outcomes = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .batch_get(&namespace, &keys);
-            for outcome in &outcomes {
-                match outcome {
-                    GetOutcome::Hit(_) => state.metrics.hits_total.fetch_add(1, Ordering::Relaxed),
-                    GetOutcome::Stale(_) => {
-                        state.metrics.stale_total.fetch_add(1, Ordering::Relaxed)
-                    }
-                    GetOutcome::Miss => state.metrics.misses_total.fetch_add(1, Ordering::Relaxed),
-                };
-            }
-            Json(BatchGetResponse::from_outcomes(outcomes)).into_response()
-        }
-        Operation::InvalidateTag { namespace, tag } => {
-            state
-                .metrics
-                .tag_invalidate_requests
-                .fetch_add(1, Ordering::Relaxed);
-            let Ok(tag) = String::from_utf8(tag) else {
-                state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                return json_error(
-                    HttpStatusCode::BAD_REQUEST,
-                    ErrorEnvelope {
-                        code: "invalid_tag",
-                        message: "tag invalidation requires a UTF-8 tag".to_string(),
-                    },
-                );
-            };
-            let removed = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .invalidate_tag(&namespace, &tag);
-            Json(InvalidateTagResponse { removed }).into_response()
-        }
-        Operation::StartLease {
-            namespace,
-            key,
-            lease_ttl_ms,
-            allow_stale_ms: _,
-        } => {
-            let outcome = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .start_lease(&namespace, &key, lease_ttl_ms);
-            match &outcome {
-                StartLeaseOutcome::Hit(_) => {
-                    state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
-                }
-                StartLeaseOutcome::Stale { .. } => {
-                    state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
-                }
-                StartLeaseOutcome::LeaseGranted { .. } => {
-                    state.metrics.lease_grants.fetch_add(1, Ordering::Relaxed);
-                }
-                StartLeaseOutcome::LeaseDenied => {
-                    state.metrics.lease_denials.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            Json(StartLeaseResponse::from(outcome)).into_response()
-        }
-        Operation::CompleteLease {
-            namespace,
-            key,
-            lease_token,
-            value,
-            metadata,
-        } => {
-            let result = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .complete_lease(CompleteLeaseCommand {
-                    namespace,
-                    key,
-                    lease_token,
-                    value,
-                    ttl: metadata.ttl,
-                    stale_ttl: metadata.stale_ttl,
-                    tags: metadata.tags,
-                    cost: metadata.cost,
-                });
-            match result {
-                Ok(_) => HttpStatusCode::CREATED.into_response(),
-                Err(CompleteLeaseError::InvalidLeaseToken) => {
-                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                    json_error(
-                        HttpStatusCode::CONFLICT,
-                        ErrorEnvelope {
-                            code: "invalid_lease_token",
-                            message: "lease token is missing, expired, or no longer active"
-                                .to_string(),
-                        },
-                    )
-                }
-                Err(CompleteLeaseError::Put(error)) => {
-                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                    put_error_response(error)
-                }
-            }
-        }
-    }
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+    (
+        HttpStatusCode::NOT_FOUND,
+        "HTTP is admin-only; use the native socket protocol for cache operations",
+    )
+        .into_response()
 }
 
 fn execute_native_request(state: &AppState, frame: RequestFrame) -> ResponseFrame {
@@ -866,7 +655,7 @@ fn metrics_response(state: &AppState) -> Response {
 
     let body = format!(
         "\
-# HELP cachebox_requests_total Total HTTP requests handled.
+# HELP cachebox_requests_total Total admin HTTP requests handled.
 # TYPE cachebox_requests_total counter
 cachebox_requests_total {}
 cachebox_requests_health_total {}
@@ -916,202 +705,6 @@ cachebox_connections_current 0
         body,
     )
         .into_response()
-}
-
-fn put_error_response(error: PutError) -> Response {
-    match error {
-        PutError::ValueTooLarge {
-            value_bytes,
-            max_value_bytes,
-        } => json_error(
-            HttpStatusCode::PAYLOAD_TOO_LARGE,
-            ErrorEnvelope {
-                code: "value_too_large",
-                message: format!(
-                    "value is {value_bytes} bytes, exceeding {max_value_bytes} byte limit"
-                ),
-            },
-        ),
-        PutError::ValueTooLargeForMemory {
-            entry_bytes,
-            max_memory_bytes,
-        } => json_error(
-            HttpStatusCode::PAYLOAD_TOO_LARGE,
-            ErrorEnvelope {
-                code: "value_too_large_for_memory",
-                message: format!(
-                    "entry needs {entry_bytes} bytes, exceeding {max_memory_bytes} byte memory limit"
-                ),
-            },
-        ),
-        PutError::InsufficientMemory {
-            required_bytes,
-            memory_used_bytes,
-            max_memory_bytes,
-        } => json_error(
-            HttpStatusCode::INSUFFICIENT_STORAGE,
-            ErrorEnvelope {
-                code: "insufficient_memory",
-                message: format!(
-                    "entry needs {required_bytes} bytes with {memory_used_bytes} of {max_memory_bytes} bytes already used"
-                ),
-            },
-        ),
-    }
-}
-
-fn get_response(outcome: GetOutcome) -> Response {
-    match outcome {
-        GetOutcome::Hit(value) => (
-            HttpStatusCode::OK,
-            [(CONTENT_TYPE, "application/octet-stream")],
-            value,
-        )
-            .into_response(),
-        GetOutcome::Stale(value) => {
-            let mut response = (
-                HttpStatusCode::OK,
-                [(CONTENT_TYPE, "application/octet-stream")],
-                value,
-            )
-                .into_response();
-            response.headers_mut().insert(
-                HeaderName::from_static("cachebox-status"),
-                HeaderValue::from_static("stale"),
-            );
-            response
-        }
-        GetOutcome::Miss => json_error(
-            HttpStatusCode::NOT_FOUND,
-            ErrorEnvelope {
-                code: "cache_miss",
-                message: "cache key was not found".to_string(),
-            },
-        ),
-    }
-}
-
-fn operation_error_response(error: OperationError) -> Response {
-    json_error(convert_status(error.status_code()), error.envelope())
-}
-
-fn json_error(status: HttpStatusCode, envelope: ErrorEnvelope) -> Response {
-    (status, Json(envelope)).into_response()
-}
-
-fn convert_status(status: StatusCode) -> HttpStatusCode {
-    match status {
-        StatusCode::Ok => HttpStatusCode::OK,
-        StatusCode::Created => HttpStatusCode::CREATED,
-        StatusCode::NoContent => HttpStatusCode::NO_CONTENT,
-        StatusCode::BadRequest => HttpStatusCode::BAD_REQUEST,
-        StatusCode::NotFound => HttpStatusCode::NOT_FOUND,
-        StatusCode::MethodNotAllowed => HttpStatusCode::METHOD_NOT_ALLOWED,
-    }
-}
-
-fn convert_method(method: &HttpMethod) -> Option<Method> {
-    match *method {
-        HttpMethod::GET => Some(Method::Get),
-        HttpMethod::PUT => Some(Method::Put),
-        HttpMethod::DELETE => Some(Method::Delete),
-        HttpMethod::POST => Some(Method::Post),
-        _ => None,
-    }
-}
-
-fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_string(), value.to_string()))
-        })
-        .collect()
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct BatchGetResponse {
-    results: Vec<BatchGetItem>,
-}
-
-impl BatchGetResponse {
-    fn from_outcomes(outcomes: Vec<GetOutcome>) -> Self {
-        Self {
-            results: outcomes.into_iter().map(BatchGetItem::from).collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct BatchGetItem {
-    status: &'static str,
-    value: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct StartLeaseResponse {
-    state: &'static str,
-    value: Option<Vec<u8>>,
-    lease_token: Option<String>,
-    stale_value: Option<Vec<u8>>,
-}
-
-impl From<StartLeaseOutcome> for StartLeaseResponse {
-    fn from(outcome: StartLeaseOutcome) -> Self {
-        match outcome {
-            StartLeaseOutcome::Hit(value) => Self {
-                state: "hit",
-                value: Some(value),
-                lease_token: None,
-                stale_value: None,
-            },
-            StartLeaseOutcome::Stale { value } => Self {
-                state: "stale",
-                value: Some(value),
-                lease_token: None,
-                stale_value: None,
-            },
-            StartLeaseOutcome::LeaseGranted { token, stale_value } => Self {
-                state: "lease_granted",
-                value: None,
-                lease_token: Some(token),
-                stale_value,
-            },
-            StartLeaseOutcome::LeaseDenied => Self {
-                state: "lease_denied",
-                value: None,
-                lease_token: None,
-                stale_value: None,
-            },
-        }
-    }
-}
-
-impl From<GetOutcome> for BatchGetItem {
-    fn from(outcome: GetOutcome) -> Self {
-        match outcome {
-            GetOutcome::Hit(value) => Self {
-                status: "hit",
-                value: Some(value),
-            },
-            GetOutcome::Stale(value) => Self {
-                status: "stale",
-                value: Some(value),
-            },
-            GetOutcome::Miss => Self {
-                status: "miss",
-                value: None,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct InvalidateTagResponse {
-    removed: usize,
 }
 
 #[allow(dead_code)]
@@ -1685,344 +1278,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_and_get_raw_bytes() {
-        let app = app(&Config::default());
-
-        let put_response = app
-            .clone()
+    async fn admin_http_rejects_cache_routes() {
+        let response = app(&Config::default())
             .oneshot(
                 Request::builder()
                     .method("PUT")
                     .uri("/v1/namespaces/default/keys/blob")
-                    .header("Cachebox-TTL", "60s")
-                    .body(Body::from(vec![0, 255, 1, 2]))
-                    .expect("request"),
-            )
-            .await
-            .expect("put response");
-        assert_eq!(put_response.status(), StatusCode::CREATED);
-
-        let get_response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/namespaces/default/keys/blob")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("get response");
-        assert_eq!(get_response.status(), StatusCode::OK);
-        assert_eq!(response_bytes(get_response).await, vec![0, 255, 1, 2]);
-    }
-
-    #[tokio::test]
-    async fn batch_get_and_tag_invalidation_work_through_http() {
-        let app = app(&Config::default());
-
-        for (key, value, tags) in [
-            ("a", "one", "group"),
-            ("b", "two", "group"),
-            ("c", "three", "other"),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("PUT")
-                        .uri(format!("/v1/namespaces/default/keys/{key}"))
-                        .header("Cachebox-Tags", tags)
-                        .body(Body::from(value.as_bytes().to_vec()))
-                        .expect("request"),
-                )
-                .await
-                .expect("put response");
-            assert_eq!(response.status(), StatusCode::CREATED);
-        }
-
-        let batch_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/namespaces/default/batch/get")
-                    .body(Body::from(r#"{"keys":["a","missing","c"]}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("batch response");
-        assert_eq!(batch_response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response_bytes(batch_response).await).expect("batch json");
-        assert_eq!(body["results"][0]["status"], "hit");
-        assert_eq!(body["results"][1]["status"], "miss");
-        assert_eq!(body["results"][2]["status"], "hit");
-
-        let invalidate_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/namespaces/default/tags/group/invalidate")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("invalidate response");
-        assert_eq!(invalidate_response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response_bytes(invalidate_response).await)
-                .expect("invalidate json");
-        assert_eq!(body["removed"], 2);
-
-        let get_response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/namespaces/default/keys/a")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("get response");
-        assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn request_body_limit_is_enforced() {
-        let config = Config {
-            max_body_bytes: 3,
-            ..Config::default()
-        };
-        let response = app(&config)
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v1/namespaces/default/keys/blob")
-                    .body(Body::from("four"))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    #[tokio::test]
-    async fn max_value_size_is_enforced_through_http() {
-        let config = Config {
-            max_value_bytes: 3,
-            ..Config::default()
-        };
-        let response = app(&config)
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v1/namespaces/default/keys/blob")
-                    .body(Body::from("four"))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response_bytes(response).await).expect("error json");
-        assert_eq!(body["code"], "value_too_large");
-    }
-
-    #[tokio::test]
-    async fn memory_cap_evicts_lru_entry_through_http() {
-        let config = Config {
-            max_memory_bytes: 240,
-            max_value_bytes: 1_000,
-            ..Config::default()
-        };
-        let app = app(&config);
-
-        for (key, value) in [("a", "1111111111"), ("b", "2222222222")] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("PUT")
-                        .uri(format!("/v1/namespaces/default/keys/{key}"))
-                        .body(Body::from(value.as_bytes().to_vec()))
-                        .expect("request"),
-                )
-                .await
-                .expect("put response");
-            assert_eq!(response.status(), StatusCode::CREATED);
-        }
-
-        let get_a = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/namespaces/default/keys/a")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("get a");
-        assert_eq!(get_a.status(), StatusCode::OK);
-
-        let put_c = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v1/namespaces/default/keys/c")
-                    .body(Body::from("3333333333"))
-                    .expect("request"),
-            )
-            .await
-            .expect("put c");
-        assert_eq!(put_c.status(), StatusCode::CREATED);
-
-        let get_b = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/namespaces/default/keys/b")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("get b");
-        assert_eq!(get_b.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_reports_request_and_engine_counters() {
-        let config = Config {
-            max_memory_bytes: 240,
-            max_value_bytes: 1_000,
-            ..Config::default()
-        };
-        let app = app(&config);
-
-        for (key, value) in [("a", "1111111111"), ("b", "2222222222")] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("PUT")
-                        .uri(format!("/v1/namespaces/default/keys/{key}"))
-                        .body(Body::from(value.as_bytes().to_vec()))
-                        .expect("request"),
-                )
-                .await
-                .expect("put response");
-            assert_eq!(response.status(), StatusCode::CREATED);
-        }
-
-        let hit = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/namespaces/default/keys/a")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("hit response");
-        assert_eq!(hit.status(), StatusCode::OK);
-
-        let evicting_put = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v1/namespaces/default/keys/c")
-                    .body(Body::from("3333333333"))
-                    .expect("request"),
-            )
-            .await
-            .expect("evicting put");
-        assert_eq!(evicting_put.status(), StatusCode::CREATED);
-
-        let miss = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/namespaces/default/keys/b")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("miss response");
-        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
-
-        let oversized = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v1/namespaces/default/keys/too-big")
-                    .body(Body::from(vec![1; 1_001]))
-                    .expect("request"),
-            )
-            .await
-            .expect("oversized response");
-        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-        let metrics = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("metrics response");
-        assert_eq!(metrics.status(), StatusCode::OK);
-        let body = String::from_utf8(response_bytes(metrics).await).expect("metrics utf-8");
-
-        assert!(body.contains("cachebox_requests_total 6"));
-        assert!(body.contains("cachebox_requests_get_total 2"));
-        assert!(body.contains("cachebox_requests_put_total 4"));
-        assert!(!body.contains("cachebox_requests_metrics_total"));
-        assert!(body.contains("cachebox_cache_hits_total 1"));
-        assert!(body.contains("cachebox_cache_misses_total 1"));
-        assert!(body.contains("cachebox_errors_total 1"));
-        assert!(body.contains("cachebox_evictions_total 1"));
-        assert!(body.contains("cachebox_memory_limit_bytes 240"));
-        assert!(body.contains("cachebox_connections_current 0"));
-
-        let second_metrics = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("second metrics response");
-        assert_eq!(second_metrics.status(), StatusCode::OK);
-        let second_body =
-            String::from_utf8(response_bytes(second_metrics).await).expect("metrics utf-8");
-        assert!(second_body.contains("cachebox_requests_total 6"));
-        assert!(!second_body.contains("cachebox_requests_metrics_total"));
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_reports_accounted_cost_score_total() {
-        let app = app(&Config::default());
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v1/namespaces/default/keys/expensive")
-                    .header("Cachebox-Cost", "99")
                     .body(Body::from("value"))
                     .expect("request"),
             )
             .await
-            .expect("put response");
-        assert_eq!(response.status(), StatusCode::CREATED);
+            .expect("response");
 
-        let metrics = app
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_bytes(response).await,
+            b"HTTP is admin-only; use the native socket protocol for cache operations".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_native_request_and_engine_counters() {
+        let state = AppState::from_config(&Config::default());
+        assert_eq!(
+            execute_native_payload(
+                &state,
+                RequestPayload::Put {
+                    namespace: "default".to_string(),
+                    key: b"expensive".to_vec(),
+                    metadata: Metadata {
+                        cost: Some(99),
+                        ..Metadata::default()
+                    },
+                    value: b"value".to_vec(),
+                },
+            ),
+            ResponsePayload::Stored { evicted: 0 }
+        );
+        assert_eq!(
+            execute_native_payload(
+                &state,
+                RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"expensive".to_vec(),
+                },
+            ),
+            ResponsePayload::Hit(b"value".to_vec())
+        );
+        assert_eq!(
+            execute_native_payload(
+                &state,
+                RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"missing".to_vec(),
+                },
+            ),
+            ResponsePayload::Miss
+        );
+
+        let metrics = app_with_state(state)
             .oneshot(
                 Request::builder()
                     .uri("/metrics")
@@ -2033,74 +1347,12 @@ mod tests {
             .expect("metrics response");
         assert_eq!(metrics.status(), StatusCode::OK);
         let body = String::from_utf8(response_bytes(metrics).await).expect("metrics utf-8");
+
+        assert!(body.contains("cachebox_requests_total 0"));
+        assert!(body.contains("cachebox_requests_get_total 2"));
+        assert!(body.contains("cachebox_requests_put_total 1"));
+        assert!(body.contains("cachebox_cache_hits_total 1"));
+        assert!(body.contains("cachebox_cache_misses_total 1"));
         assert!(body.contains("cachebox_cost_score_total 99"));
-    }
-
-    #[tokio::test]
-    async fn leases_can_be_acquired_denied_and_completed_through_http() {
-        let app = app(&Config::default());
-
-        let lease = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/namespaces/default/leases/missing")
-                    .body(Body::from(r#"{"lease_ttl_ms":10000}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("lease response");
-        assert_eq!(lease.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response_bytes(lease).await).expect("lease json");
-        assert_eq!(body["state"], "lease_granted");
-        let token = body["lease_token"]
-            .as_str()
-            .expect("lease token")
-            .to_string();
-
-        let denied = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/namespaces/default/leases/missing")
-                    .body(Body::from(r#"{"lease_ttl_ms":10000}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("denied response");
-        assert_eq!(denied.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&response_bytes(denied).await).expect("denied json");
-        assert_eq!(body["state"], "lease_denied");
-
-        let complete = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/v1/namespaces/default/leases/missing/complete")
-                    .header("Cachebox-Lease-Token", token)
-                    .header("Cachebox-TTL", "60s")
-                    .body(Body::from("fresh"))
-                    .expect("request"),
-            )
-            .await
-            .expect("complete response");
-        assert_eq!(complete.status(), StatusCode::CREATED);
-
-        let get = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/namespaces/default/keys/missing")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("get response");
-        assert_eq!(get.status(), StatusCode::OK);
-        assert_eq!(response_bytes(get).await, b"fresh".to_vec());
     }
 }

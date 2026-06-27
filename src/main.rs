@@ -11,7 +11,7 @@ async fn main() -> ExitCode {
     match Config::from_args(env::args().skip(1)) {
         Ok(config) => {
             let report = server::startup_report(&config);
-            println!("bind_addr={}", report.bind_addr);
+            println!("admin_bind_addr={}", report.admin_bind_addr);
             println!(
                 "native_bind_addr={}",
                 report.native_bind_addr.as_deref().unwrap_or("disabled")

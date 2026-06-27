@@ -1,22 +1,23 @@
 # Native Sockets
 
 Cachebox can expose the binary native data plane over TCP and, on Unix
-platforms, Unix domain sockets. The HTTP/2 API is still available during the
-transport migration.
+platforms, Unix domain sockets. Cache operations use this native protocol.
+HTTP is admin-only and exposes health and metrics.
 
 ## Start TCP
 
 ```sh
 cargo run --bin cachebox -- \
-  --bind 127.0.0.1:7400 \
   --native-bind 127.0.0.1:7401
 ```
+
+`127.0.0.1:7401` is the default native TCP listener, so `cargo run --bin
+cachebox` is enough for local TCP use.
 
 ## Start Unix Socket
 
 ```sh
 cargo run --bin cachebox -- \
-  --bind 127.0.0.1:7400 \
   --native-unix /tmp/cachebox.sock
 ```
 

@@ -1,20 +1,21 @@
 # Cachebox
 
 Cachebox is a self-hosted cache server for applications that need explicit
-cache behavior over a simple HTTP API. It stores raw-byte values, attaches cache
-metadata at write time, coordinates expensive refreshes with leases, invalidates
-related entries with tags, keeps memory bounded, and exposes Prometheus-style
-metrics.
+cache semantics: raw-byte values, TTLs, stale windows, tag invalidation,
+bounded memory, metrics, and lease-based stampede protection.
 
-The project is written in Rust and runs as a single binary. The current server
-accepts HTTP/2 cleartext.
+The server runs as a single Rust binary. Cache operations use Cachebox's native
+socket protocol over TCP by default and Unix domain sockets when configured.
+HTTP is kept as an admin surface for health and Prometheus-style metrics.
 
 ## Design Principles
 
 - **Cache semantics first.** Reads, writes, TTLs, stale windows, tags, leases,
   memory limits, and metrics are first-class operations.
-- **Raw bytes in the data path.** Values are stored and returned as bytes; JSON
-  is used only for small control envelopes such as batch reads and lease state.
+- **Native data plane.** Cache operations use a compact binary protocol instead
+  of HTTP routing, headers, and JSON envelopes.
+- **Raw bytes in the data path.** Values are stored and returned as bytes.
+  Structured metadata stays small and explicit.
 - **Self-hostable by default.** The binary should be easy to run on a laptop,
   VPS, homelab machine, or small internal service.
 - **Bounded memory.** Cachebox accounts for approximate entry memory, enforces
@@ -28,24 +29,22 @@ accepts HTTP/2 cleartext.
 ## Features
 
 - Single `cachebox` server binary.
-- HTTP API for get, put, delete, batch get, tag invalidation, lease start, and
-  lease completion.
-- Percent-encoded byte keys under named namespaces.
-- Raw-byte values.
+- Native TCP cache data plane enabled by default on `127.0.0.1:7401`.
+- Optional native Unix socket data plane.
+- Admin HTTP health and metrics on `127.0.0.1:7400`.
+- Get, put, delete, batch get, tag invalidation, lease start, and lease
+  completion.
+- Namespaced byte keys and raw-byte values.
 - Fresh TTL and stale TTL metadata.
 - Tag-based invalidation.
 - Lease-based stampede protection for expensive recomputation.
 - Approximate memory accounting with max body, max value, and max memory limits.
 - Approximate LRU eviction.
 - Prometheus-style `/metrics`.
-- Reserved `Cachebox-Cost` metadata with side-effect-free aggregate cost-score
-  metrics.
-- Rust AI helper utilities:
-  - prompt/result cache keys
-  - embedding cache keys
-  - generation lease decisions
-  - buffer-then-commit stream capture
-- Local benchmark harness.
+- Reserved cost metadata with side-effect-free aggregate cost-score metrics.
+- Rust AI helper utilities for prompt keys, embedding keys, generation leases,
+  and buffer-then-commit stream capture.
+- Local benchmark harness for engine, native TCP, and native Unix socket paths.
 
 ## Quickstart
 
@@ -58,39 +57,56 @@ cargo build
 Run:
 
 ```sh
-cargo run --bin cachebox -- --bind 127.0.0.1:7400
+cargo run --bin cachebox
 ```
 
-Store a value:
+The default listeners are:
 
-```sh
-curl --http2-prior-knowledge -i \
-  -X PUT 'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123' \
-  -H 'Cachebox-TTL: 300s' \
-  -H 'Cachebox-Tags: user:123,org:9' \
-  -H 'Cachebox-Cost: 42' \
-  -H 'Content-Type: application/octet-stream' \
-  --data-binary 'cached bytes'
+```text
+admin HTTP: 127.0.0.1:7400
+native TCP: 127.0.0.1:7401
 ```
 
-Read it:
+Use the Rust native client:
 
-```sh
-curl --http2-prior-knowledge -i \
-  'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123'
+```rust
+use cachebox::api::Ttl;
+use cachebox::client::NativeClient;
+use cachebox::protocol::{Metadata, ResponsePayload};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = NativeClient::connect_tcp("127.0.0.1:7401").await?;
+
+    client
+        .put(
+            "default",
+            b"user:123".to_vec(),
+            Metadata {
+                ttl: Some(Ttl {
+                    milliseconds: 300_000,
+                }),
+                tags: vec!["user:123".to_string(), "org:9".to_string()],
+                cost: Some(42),
+                ..Metadata::default()
+            },
+            b"cached bytes".to_vec(),
+        )
+        .await?;
+
+    let value = client.get("default", b"user:123".to_vec()).await?;
+    assert_eq!(value, ResponsePayload::Hit(b"cached bytes".to_vec()));
+
+    assert!(client.delete("default", b"user:123".to_vec()).await?);
+
+    Ok(())
+}
 ```
 
-Delete it:
+Check admin metrics:
 
 ```sh
-curl --http2-prior-knowledge -i \
-  -X DELETE 'http://127.0.0.1:7400/v1/namespaces/default/keys/user%3A123'
-```
-
-Check metrics:
-
-```sh
-curl --http2-prior-knowledge 'http://127.0.0.1:7400/metrics'
+curl 'http://127.0.0.1:7400/metrics'
 ```
 
 More examples are in [docs/quickstart.md](docs/quickstart.md) and
@@ -101,6 +117,8 @@ More examples are in [docs/quickstart.md](docs/quickstart.md) and
 ```sh
 cargo run --bin cachebox -- \
   --bind 127.0.0.1:7400 \
+  --native-bind 127.0.0.1:7401 \
+  --native-unix /tmp/cachebox.sock \
   --max-body-bytes 8388608 \
   --max-memory-bytes 67108864 \
   --max-value-bytes 8388608 \
@@ -123,9 +141,9 @@ cargo run --bin cachebox-bench
 ```
 
 The harness covers cached hits, unique writes, batch reads, lease contention,
-tag invalidation, TTL-heavy writes, eviction pressure, and cost-shaped writes.
-Current baseline output and scenario descriptions are in
-[docs/benchmarks.md](docs/benchmarks.md).
+tag invalidation, TTL-heavy writes, eviction pressure, and cost-shaped writes
+across engine, native TCP, and native Unix socket paths. Current baseline output
+and scenario descriptions are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Documentation
 
@@ -161,17 +179,19 @@ cargo test --test spawned_client -- --ignored
 ```text
 src/
   ai.rs                AI-oriented helper utilities
-  api.rs               HTTP API route and metadata parsing
+  api.rs               shared metadata and admin HTTP route constants
+  client.rs            native socket client
   config.rs            CLI and startup configuration parsing
   engine.rs            in-memory cache engine
   lib.rs               library module exports
   main.rs              binary entrypoint
-  operation.rs         typed cache operation parser
-  server.rs            HTTP server
+  protocol.rs          native socket protocol codec
+  server.rs            admin HTTP and native socket server
 docs/
   README.md            documentation index
   quickstart.md        first-run guide
-  usage.md             user-facing API examples
+  usage.md             user-facing native client examples
+  native-sockets.md    native socket protocol and client usage
   ai-helpers.md        AI helper examples
   benchmarks.md        benchmark command and baseline
   internal/            planning, architecture, and historical notes

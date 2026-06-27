@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:7400";
+const DEFAULT_NATIVE_BIND_ADDR: &str = "127.0.0.1:7401";
 const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
@@ -27,7 +28,11 @@ impl Default for Config {
             bind_addr: DEFAULT_BIND_ADDR
                 .parse()
                 .expect("default bind address must be valid"),
-            native_bind_addr: None,
+            native_bind_addr: Some(
+                DEFAULT_NATIVE_BIND_ADDR
+                    .parse()
+                    .expect("default native bind address must be valid"),
+            ),
             native_unix_socket: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
@@ -204,11 +209,11 @@ Usage:
   {program_name} --help
 
 Options:
-  --bind <addr:port>  Address for the HTTP server to bind.
+  --bind <addr:port>  Address for the HTTP admin server to bind.
                       Default: {DEFAULT_BIND_ADDR}
   --native-bind <addr:port>
                       Address for the native TCP data-plane listener.
-                      Disabled unless provided.
+                      Default: {DEFAULT_NATIVE_BIND_ADDR}
   --native-unix <path>
                       Path for the native Unix socket data-plane listener.
                       Disabled unless provided. Unix platforms only.
@@ -239,7 +244,10 @@ mod tests {
         let config = Config::from_args(Vec::<String>::new()).expect("default config");
 
         assert_eq!(config.bind_addr.to_string(), DEFAULT_BIND_ADDR);
-        assert_eq!(config.native_bind_addr, None);
+        assert_eq!(
+            config.native_bind_addr.map(|addr| addr.to_string()),
+            Some(DEFAULT_NATIVE_BIND_ADDR.to_string())
+        );
         assert_eq!(config.native_unix_socket, None);
         assert_eq!(config.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
         assert_eq!(config.max_memory_bytes, DEFAULT_MAX_MEMORY_BYTES);
