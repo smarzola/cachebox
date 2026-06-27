@@ -7,7 +7,7 @@ checkpointed loops.
 
 You are building Cachebox, a Rust cache server for self-hosted applications. The
 MVP must be correct, measurable, and intentionally narrow. Do not build a full
-Redis clone. Build a cache-first server with a small Redis-compatible adapter.
+Redis clone. Build an HTTP/2-first cache server with native cache semantics.
 
 ## Operating Loop
 
@@ -40,9 +40,10 @@ Goal:
 
 Implementation:
 
-- Add module stubs for protocol, command parsing, engine, config, and server.
+- Add module stubs for API routing, operation parsing, engine, config, and
+  server.
 - Add a `--help` friendly CLI using a minimal dependency only if needed.
-- Keep the binary runnable even before the TCP server exists.
+- Keep the binary runnable even before the HTTP server exists.
 
 Checkpoint:
 
@@ -55,55 +56,55 @@ Testing techniques:
 - Unit test any config parsing.
 - Snapshot-free tests only; prefer explicit assertions.
 
-## Milestone 1: RESP2 Parser and Encoder
+## Milestone 1: HTTP API Contract
 
 Goal:
 
-- Parse and encode enough RESP2 for Redis cache commands.
+- Define and test the HTTP request and response contract for cache operations.
 
 Implementation:
 
-- Parse arrays, bulk strings, simple strings, integers, errors, and null bulk
-  strings.
-- Preserve byte strings without assuming UTF-8.
-- Enforce maximum frame size.
-- Return structured parse errors.
+- Choose the HTTP framework.
+- Define route shapes under `/v1/namespaces/{namespace}`.
+- Define TTL, stale TTL, tag, cost, and content-type metadata.
+- Define response status codes and JSON error envelopes.
+- Preserve cache values as raw bytes.
 
 Checkpoint:
 
-- Parser handles complete frames, partial frames, malformed frames, and pipelined
-  frames.
-- Encoder round-trips expected Redis-compatible responses.
+- API contract is documented in the code and README.
+- Raw-byte values can be represented without UTF-8 assumptions.
+- Error responses are deterministic.
 
 Testing techniques:
 
-- Unit tests for every RESP type.
-- Fuzz-like table tests for malformed inputs.
-- Tests for partial buffers and multiple frames in one buffer.
+- Unit tests for route parsing and metadata parsing.
+- Table tests for malformed TTLs, tags, namespaces, and percent-encoded keys.
+- Explicit tests for binary values.
 
-## Milestone 2: Command Parsing
+## Milestone 2: Operation Parsing
 
 Goal:
 
-- Convert RESP arrays into typed cache commands.
+- Convert HTTP requests into typed cache operations.
 
 Implementation:
 
-- Support `PING`, `GET`, `SET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `MGET`, `MSET`,
-  and `FLUSHDB`.
-- Handle command names case-insensitively.
-- Validate arity and return Redis-like errors.
+- Support get, put, delete, batch get, tag invalidation, lease start, and lease
+  completion operations.
+- Validate request methods, paths, headers, and bodies.
 - Preserve key/value bytes.
+- Return structured application errors.
 
 Checkpoint:
 
-- Every supported command has valid and invalid arity tests.
-- Unsupported commands produce a deterministic error.
+- Every supported operation has valid and invalid request tests.
+- Unsupported routes produce deterministic errors.
 
 Testing techniques:
 
-- Table-driven command parser tests.
-- Compatibility tests for common Redis command spellings and casing.
+- Table-driven operation parser tests.
+- HTTP handler tests that do not require opening sockets.
 
 ## Milestone 3: In-Memory Cache Engine
 
@@ -114,14 +115,14 @@ Goal:
 Implementation:
 
 - Store byte keys and byte values.
-- Implement `GET`, `SET`, `DEL`, `EXISTS`, `MGET`, `MSET`, and `FLUSHDB`.
-- Add TTL support for `SET` options if included, `EXPIRE`, and `TTL`.
+- Implement get, put, delete, batch get, and tag invalidation.
+- Add TTL and stale TTL support.
 - Use lazy expiration on access.
 
 Checkpoint:
 
 - Expired keys disappear from reads.
-- `TTL` returns Redis-compatible values for missing, no-expiry, and expiring
+- TTL metadata behaves correctly for missing, no-expiry, expiring, and stale
   keys.
 - Multi-key commands behave correctly with mixed hits and misses.
 
@@ -131,31 +132,32 @@ Testing techniques:
 - Boundary tests for zero, negative, and very large TTLs.
 - Property-style tests for idempotent deletes and existence counts if practical.
 
-## Milestone 4: TCP Server
+## Milestone 4: HTTP/2 Server
 
 Goal:
 
-- Serve the command set over TCP using RESP2.
+- Serve the operation set over HTTP.
 
 Implementation:
 
 - Use `tokio`.
+- Support HTTP/2 and allow HTTP/1.1 for local tooling if the framework makes it
+  cheap.
 - Accept multiple clients.
-- Support pipelined requests.
-- Apply read frame limits.
+- Apply request body limits.
 - Keep shutdown behavior simple and testable.
 
 Checkpoint:
 
-- `redis-cli PING` works.
-- `redis-cli SET foo bar` and `redis-cli GET foo` work.
-- Multiple commands in one connection work.
+- `curl` or an HTTP client can put and get raw-byte values.
+- Batch get works through the HTTP API.
+- Tag invalidation works through the HTTP API.
 
 Testing techniques:
 
-- Async integration tests opening TCP connections.
-- Raw RESP request tests.
-- Optional smoke test using `redis-cli` when available.
+- Async integration tests opening an HTTP client.
+- Raw-byte body tests.
+- HTTP/2 smoke test where the client stack exposes protocol selection.
 
 ## Milestone 5: Memory Limits and Eviction
 
@@ -192,9 +194,9 @@ Goal:
 Implementation:
 
 - Add structured logs.
-- Track command counts, hits, misses, expirations, evictions, errors, memory, and
-  connection count.
-- Expose metrics through a simple HTTP endpoint or a text admin command.
+- Track request counts, hits, misses, stale responses, lease grants, lease
+  denials, expirations, evictions, errors, memory, and connection count.
+- Expose metrics through an HTTP endpoint.
 
 Checkpoint:
 
@@ -204,29 +206,31 @@ Checkpoint:
 Testing techniques:
 
 - Unit tests against metrics counters.
-- Integration test for metrics endpoint if HTTP is added.
+- Integration test for the metrics endpoint.
 
-## Milestone 7: Compatibility Smoke Tests
+## Milestone 7: Client Smoke Tests
 
 Goal:
 
-- Prove Cachebox works with real Redis clients for the supported subset.
+- Prove Cachebox works with real HTTP clients and a first official client.
 
 Implementation:
 
-- Add smoke tests using at least one Rust Redis client.
+- Add smoke tests using a Rust HTTP client.
 - Add a small script or test fixture that exercises the server like an app cache.
-- Document supported commands.
+- Start one official client package or client module if the repo layout supports
+  it.
+- Document supported endpoints.
 
 Checkpoint:
 
-- Client library can connect, set, get, expire, and delete.
-- Unsupported commands fail predictably.
+- Client can put, get, delete, batch get, invalidate tags, and use leases.
+- Unsupported routes fail predictably.
 
 Testing techniques:
 
 - Integration tests spawning the Cachebox binary on a random local port.
-- Contract tests comparing selected behavior to Redis when Redis is available.
+- Contract tests asserting HTTP status codes, headers, and byte bodies.
 
 ## Milestone 8: Benchmark Harness
 
@@ -236,8 +240,8 @@ Goal:
 
 Implementation:
 
-- Add benchmarks for `GET`, `SET`, `MGET`, pipelined `GET`, TTL-heavy writes,
-  and eviction pressure.
+- Add benchmarks for single-key get, single-key put, batch get, lease
+  contention, tag invalidation, TTL-heavy writes, and eviction pressure.
 - Track p50, p95, p99, throughput, and memory overhead.
 
 Checkpoint:
@@ -252,11 +256,12 @@ Testing techniques:
 - Benchmark against loopback.
 - Include warmup and fixed-duration runs.
 
-## Milestone 9: Native Cache Feature Spike
+## Milestone 9: Native Cache Feature Hardening
 
 Goal:
 
-- Add the first feature that makes Cachebox more than a Redis subset.
+- Harden the first feature that makes Cachebox more than a generic key/value
+  cache.
 
 Recommended first feature:
 
@@ -265,7 +270,7 @@ Recommended first feature:
 Implementation:
 
 - Add an internal lease state per key.
-- Add a native command or experimental endpoint for `GET_OR_LEASE`.
+- Add an experimental endpoint for lease acquisition.
 - Return structured states: hit, stale hit, lease granted, lease denied, miss.
 
 Checkpoint:
@@ -285,11 +290,11 @@ Testing techniques:
 The MVP is done when:
 
 - The server builds and runs as a single binary.
-- Supported Redis cache commands work over TCP.
+- Supported cache operations work over HTTP/2.
 - TTL behavior is correct.
 - Memory limits are enforced.
 - Basic metrics exist.
-- Integration tests cover real client behavior.
+- Integration tests cover real HTTP client behavior.
 - Benchmarks establish a baseline.
 - Documentation clearly states supported and unsupported behavior.
 

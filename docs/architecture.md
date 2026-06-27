@@ -3,17 +3,18 @@
 ## Product Boundary
 
 Cachebox is a cache server, not a database. It should optimize for ephemeral
-values, bounded memory, low latency, and explicit invalidation. Redis
-compatibility is an adoption layer; native cache features are the differentiator.
+values, bounded memory, low latency, explicit invalidation, and recomputation
+coordination. The primary API is native HTTP/2; Redis compatibility is a
+possible future adapter, not an MVP constraint.
 
 The MVP should be intentionally small:
 
-- RESP2 wire protocol.
-- One in-memory keyspace.
+- HTTP/2 server.
+- Namespaced in-memory keyspace.
 - Byte-string keys and values.
-- TTL metadata.
+- TTL and stale TTL metadata.
 - Bounded memory.
-- A small command set.
+- A small cache operation set.
 - No persistence.
 - No replication.
 - No scripting.
@@ -21,13 +22,12 @@ The MVP should be intentionally small:
 ## High-Level System
 
 ```text
-TCP listener
-  -> connection task
-  -> RESP parser
-  -> command router
+HTTP/2 listener
+  -> request router
+  -> auth and namespace resolution
+  -> cache operation decoder
   -> cache engine
-  -> RESP encoder
-  -> socket writer
+  -> response encoder
 ```
 
 The initial implementation can use a single shared engine protected by a lock if
@@ -35,73 +35,78 @@ that makes correctness faster to reach. The performance-oriented design should
 move to sharded ownership:
 
 ```text
-accept loop
-  -> connection tasks parse requests
+HTTP server
+  -> request tasks decode cache operations
   -> key hash selects shard
   -> shard owns map, TTL index, eviction state
-  -> response returns to connection task
+  -> response returns to request task
 ```
 
-Each shard should own its data so ordinary `GET` and `SET` paths avoid global
-locks. Cross-key commands such as `MGET` can fan out to multiple shards.
+Each shard should own its data so ordinary read and write paths avoid global
+locks. Batch operations can fan out to multiple shards.
 
 ## Core Components
 
-### Network Runtime
+### HTTP Runtime
 
-Use `tokio` for the MVP. It provides enough performance and keeps the codebase
-approachable. Revisit lower-level networking only after benchmark data shows
-Tokio overhead dominates.
+Use `tokio` plus a Rust HTTP stack that supports HTTP/2 cleanly. The exact
+framework should be chosen during implementation, but the transport should keep
+raw-byte bodies efficient and avoid forcing JSON for cached values.
 
 Responsibilities:
 
-- Bind TCP address.
-- Accept connections.
-- Enforce max connection count.
-- Parse pipelined RESP requests.
-- Write responses without unnecessary allocation.
-- Apply read/write timeouts where appropriate.
+- Bind an HTTP address.
+- Serve HTTP/2 by default and allow HTTP/1.1 for local tooling if cheap.
+- Enforce max connection and request limits.
+- Preserve request and response bodies as bytes.
+- Apply request body size limits.
+- Apply request deadlines where appropriate.
 
-### RESP Layer
+### API Layer
 
-Support RESP2 first:
+The data plane uses HTTP paths, headers, and raw-byte bodies.
 
-- Simple strings.
-- Errors.
-- Integers.
-- Bulk strings.
-- Arrays.
-- Null bulk strings.
+Initial endpoints:
 
-Parser rules:
+- `GET /v1/namespaces/{namespace}/keys/{key}`
+- `PUT /v1/namespaces/{namespace}/keys/{key}`
+- `DELETE /v1/namespaces/{namespace}/keys/{key}`
+- `POST /v1/namespaces/{namespace}/batch/get`
+- `POST /v1/namespaces/{namespace}/tags/{tag}/invalidate`
+- `POST /v1/namespaces/{namespace}/leases/{key}`
+- `PUT /v1/namespaces/{namespace}/leases/{key}/complete`
+- `GET /healthz`
+- `GET /metrics`
 
-- Enforce maximum frame size.
-- Reject malformed input with Redis-like protocol errors.
-- Preserve keys and values as bytes.
-- Avoid UTF-8 assumptions.
+Value rules:
 
-### Command Layer
+- Cache values are raw bytes.
+- Metadata travels in headers for simple operations.
+- Structured states such as lease responses use JSON.
+- Keys in paths must be percent-encoded.
+- Batch endpoints use JSON request bodies initially and may gain a binary format
+  later.
 
-The command layer maps protocol frames to typed operations.
+### Operation Layer
 
-MVP command set:
+The operation layer maps HTTP requests to typed cache operations.
 
-- `PING`
-- `GET`
-- `SET`
-- `DEL`
-- `EXISTS`
-- `EXPIRE`
-- `TTL`
-- `MGET`
-- `MSET`
-- `FLUSHDB`
+MVP operation set:
 
-Compatibility principle:
+- Get key.
+- Put key with TTL, stale TTL, tags, and optional cost metadata.
+- Delete key.
+- Batch get.
+- Invalidate tag.
+- Start lease for stampede protection.
+- Complete lease with refreshed value.
 
-- Match Redis behavior where it is cheap and clear.
-- Return explicit unsupported-command errors for everything else.
-- Add commands only when real target applications need them.
+API principle:
+
+- Make cache semantics explicit.
+- Keep value transport byte-oriented.
+- Use JSON only where structured control responses are useful.
+- Add endpoints only when the engine has tests for the underlying behavior.
 
 ### Cache Engine
 
@@ -113,6 +118,8 @@ Entry shape:
 key: bytes
 value: bytes
 expires_at: optional instant
+stale_until: optional instant
+tags: zero or more byte/string tags
 last_access: approximate timestamp or counter
 memory_cost: estimated bytes
 ```
@@ -122,6 +129,8 @@ Expiration:
 - Lazy expiration on reads and writes.
 - Background expiration pass.
 - TTL lookup should not require scanning the full map.
+- Stale values can be served only when an operation explicitly allows stale
+  responses.
 
 Eviction:
 
@@ -146,28 +155,32 @@ Memory accounting:
 MVP observability should include:
 
 - Structured logs.
-- Request counts by command.
+- Request counts by endpoint and operation.
 - Error counts.
 - Cache hits and misses.
+- Stale responses served.
+- Lease grants and denials.
 - Expired keys.
 - Evicted keys.
 - Memory used and memory limit.
 - Current connection count.
 
-Metrics can start as an HTTP `/metrics` endpoint or periodic log output. A
-Prometheus endpoint is preferred once the server has an HTTP admin listener.
+Expose metrics through HTTP. A Prometheus-compatible `/metrics` endpoint is the
+preferred default.
 
-## Native Cache API Direction
+## Cache API Semantics
 
-The Redis adapter should not constrain the native model. Native features should
-be designed around common cache failure modes.
+Native features should be designed around common cache failure modes.
 
 ### Stampede Protection
 
 Proposed operation:
 
-```text
-GET_OR_LEASE key lease=10s stale=60s
+```http
+POST /v1/namespaces/default/leases/user%3A123
+Content-Type: application/json
+
+{"lease_ttl_ms":10000,"allow_stale_ms":60000}
 ```
 
 Responses:
@@ -191,9 +204,13 @@ refreshes the entry.
 
 Native writes can attach tags:
 
-```text
-SET key value ttl=5m tags=user:42,workspace:abc
-INVALIDATE_TAG user:42
+```http
+PUT /v1/namespaces/default/keys/dashboard%3A42
+Cachebox-TTL: 5m
+Cachebox-Tags: user:42,workspace:abc
+Content-Type: application/octet-stream
+
+<raw bytes>
 ```
 
 This requires a reverse index from tag to keys and careful cleanup when entries
@@ -216,7 +233,7 @@ Each namespace can define:
 - Bind to `127.0.0.1` by default.
 - Require explicit configuration for public interfaces.
 - Support simple token auth before broad deployment.
-- Enforce max frame size and max value size.
+- Enforce max request size and max value size.
 - Avoid panic paths on malformed client input.
 
 ## Performance Principles
@@ -230,10 +247,11 @@ Each namespace can define:
 
 ## Open Design Questions
 
-- Should the native API be binary TCP, HTTP/2, or both?
-- How much Redis behavior should `SET` options support in the MVP?
-- Should unsupported Redis commands return `ERR unknown command` or a clearer
-  Cachebox-specific error in compatibility mode?
-- Which first real applications should drive compatibility testing?
+- Which Rust HTTP stack should the MVP use?
+- Should local development allow HTTP/1.1 by default alongside HTTP/2?
+- Should batch endpoints start as JSON or use a compact binary format
+  immediately?
+- Which first official clients should be written: TypeScript, Python, Rust, or
+  Go?
 - Should eviction start with random eviction for simplicity or approximate LRU
   for better cache behavior?
