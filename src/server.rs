@@ -29,7 +29,7 @@ use crate::engine::{
 use crate::protocol::{
     BatchItem, Command, DecodeError, ErrorCode, HEADER_LEN, Metadata as NativeMetadata,
     RequestFrame, RequestPayload, ResponseFrame, ResponsePayload, decode_request_frame,
-    encode_response_frame,
+    encode_response_frame_into,
 };
 
 #[derive(Debug, Clone)]
@@ -338,6 +338,8 @@ async fn handle_native_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut frame = Vec::new();
+    let mut response_buffer = Vec::new();
     loop {
         let mut header = [0; HEADER_LEN];
         match stream.read_exact(&mut header).await {
@@ -352,7 +354,7 @@ where
             return Ok(());
         }
 
-        let mut frame = Vec::with_capacity(HEADER_LEN + payload_len);
+        frame.clear();
         frame.extend_from_slice(&header);
         let start = frame.len();
         frame.resize(HEADER_LEN + payload_len, 0);
@@ -362,13 +364,15 @@ where
             Ok(request) => request,
             Err(error) => {
                 if let Some(response) = native_decode_error_response(&frame, error) {
-                    stream.write_all(&encode_response_frame(&response)).await?;
+                    encode_response_frame_into(&response, &mut response_buffer);
+                    stream.write_all(&response_buffer).await?;
                 }
                 return Ok(());
             }
         };
         let response = execute_native_request(&state, request);
-        stream.write_all(&encode_response_frame(&response)).await?;
+        encode_response_frame_into(&response, &mut response_buffer);
+        stream.write_all(&response_buffer).await?;
     }
 }
 

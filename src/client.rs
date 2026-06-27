@@ -9,7 +9,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::protocol::{
     BatchItem, Command, DecodeError, ErrorCode, HEADER_LEN, Metadata, RequestFrame, RequestPayload,
-    ResponsePayload, decode_response_frame, encode_request_frame,
+    ResponsePayload, decode_response_frame, encode_request_frame_into,
 };
 
 #[derive(Debug)]
@@ -49,6 +49,8 @@ pub struct NativeClient {
     stream: NativeStream,
     next_request_id: u64,
     max_payload_len: usize,
+    request_buffer: Vec<u8>,
+    response_buffer: Vec<u8>,
 }
 
 enum NativeStream {
@@ -63,6 +65,8 @@ impl NativeClient {
             stream: NativeStream::Tcp(TcpStream::connect(addr).await?),
             next_request_id: 1,
             max_payload_len: usize::MAX,
+            request_buffer: Vec::new(),
+            response_buffer: Vec::new(),
         })
     }
 
@@ -72,6 +76,8 @@ impl NativeClient {
             stream: NativeStream::Unix(UnixStream::connect(path).await?),
             next_request_id: 1,
             max_payload_len: usize::MAX,
+            request_buffer: Vec::new(),
+            response_buffer: Vec::new(),
         })
     }
 
@@ -243,19 +249,20 @@ impl NativeClient {
             command,
             payload,
         };
-        self.write_all(&encode_request_frame(&request)).await?;
+        encode_request_frame_into(&request, &mut self.request_buffer);
+        self.write_all_request_buffer().await?;
 
         let mut header = [0u8; HEADER_LEN];
         self.read_exact(&mut header).await?;
         let payload_len =
             u32::from_be_bytes(header[16..20].try_into().expect("header payload length")) as usize;
-        let mut response = Vec::with_capacity(HEADER_LEN + payload_len);
-        response.extend_from_slice(&header);
-        let start = response.len();
-        response.resize(HEADER_LEN + payload_len, 0);
-        self.read_exact(&mut response[start..]).await?;
+        self.response_buffer.clear();
+        self.response_buffer.extend_from_slice(&header);
+        let start = self.response_buffer.len();
+        self.response_buffer.resize(HEADER_LEN + payload_len, 0);
+        self.read_response_payload(start).await?;
 
-        let response = decode_response_frame(&response, self.max_payload_len)?;
+        let response = decode_response_frame(&self.response_buffer, self.max_payload_len)?;
         if response.request_id != request_id || response.command != command {
             return Err(ClientError::UnexpectedResponse("response header mismatch"));
         }
@@ -265,11 +272,11 @@ impl NativeClient {
         }
     }
 
-    async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    async fn write_all_request_buffer(&mut self) -> std::io::Result<()> {
         match &mut self.stream {
-            NativeStream::Tcp(stream) => stream.write_all(bytes).await,
+            NativeStream::Tcp(stream) => stream.write_all(&self.request_buffer).await,
             #[cfg(unix)]
-            NativeStream::Unix(stream) => stream.write_all(bytes).await,
+            NativeStream::Unix(stream) => stream.write_all(&self.request_buffer).await,
         }
     }
 
@@ -278,6 +285,18 @@ impl NativeClient {
             NativeStream::Tcp(stream) => stream.read_exact(bytes).await,
             #[cfg(unix)]
             NativeStream::Unix(stream) => stream.read_exact(bytes).await,
+        }
+    }
+
+    async fn read_response_payload(&mut self, start: usize) -> std::io::Result<usize> {
+        match &mut self.stream {
+            NativeStream::Tcp(stream) => {
+                stream.read_exact(&mut self.response_buffer[start..]).await
+            }
+            #[cfg(unix)]
+            NativeStream::Unix(stream) => {
+                stream.read_exact(&mut self.response_buffer[start..]).await
+            }
         }
     }
 }

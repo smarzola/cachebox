@@ -256,9 +256,20 @@ pub fn decode_request_frame(
 }
 
 pub fn encode_request_frame(frame: &RequestFrame) -> Vec<u8> {
-    let mut payload = Vec::new();
-    encode_request_payload(&frame.payload, &mut payload);
-    encode_frame(KIND_REQUEST, frame.command, frame.request_id, &payload)
+    let mut out = Vec::new();
+    encode_request_frame_into(frame, &mut out);
+    out
+}
+
+pub fn encode_request_frame_into(frame: &RequestFrame, out: &mut Vec<u8>) {
+    encode_frame_into(
+        KIND_REQUEST,
+        frame.command,
+        frame.request_id,
+        &frame.payload,
+        encode_request_payload,
+        out,
+    );
 }
 
 pub fn decode_response_frame(
@@ -287,9 +298,20 @@ pub fn decode_response_frame(
 }
 
 pub fn encode_response_frame(frame: &ResponseFrame) -> Vec<u8> {
-    let mut payload = Vec::new();
-    encode_response_payload(&frame.payload, &mut payload);
-    encode_frame(KIND_RESPONSE, frame.command, frame.request_id, &payload)
+    let mut out = Vec::new();
+    encode_response_frame_into(frame, &mut out);
+    out
+}
+
+pub fn encode_response_frame_into(frame: &ResponseFrame, out: &mut Vec<u8>) {
+    encode_frame_into(
+        KIND_RESPONSE,
+        frame.command,
+        frame.request_id,
+        &frame.payload,
+        encode_response_payload,
+        out,
+    );
 }
 
 fn decode_response_payload(
@@ -345,18 +367,31 @@ fn decode_response_payload(
     }
 }
 
-fn encode_frame(kind: u8, command: Command, request_id: u64, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
+fn encode_frame_into<T>(
+    kind: u8,
+    command: Command,
+    request_id: u64,
+    payload: &T,
+    encode_payload: fn(&T, &mut Vec<u8>),
+    out: &mut Vec<u8>,
+) {
+    out.clear();
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
     out.push(kind);
     out.push(command.id());
     out.push(0);
     out.extend_from_slice(&request_id.to_be_bytes());
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes());
-    out.extend_from_slice(payload);
-    out
+    out.extend_from_slice(&0u32.to_be_bytes());
+    let payload_start = out.len();
+    encode_payload(payload, out);
+    let payload_len = out.len() - payload_start;
+    assert!(
+        u32::try_from(payload_len).is_ok(),
+        "native payload too large"
+    );
+    out[16..20].copy_from_slice(&(payload_len as u32).to_be_bytes());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -886,6 +921,43 @@ mod tests {
         assert_eq!(encoded[24], 0x01);
         assert_eq!(u32::from_be_bytes(encoded[25..29].try_into().unwrap()), 5);
         assert_eq!(&encoded[29..34], b"bytes");
+    }
+
+    #[test]
+    fn encode_into_reuses_and_truncates_existing_buffers() {
+        let request = RequestFrame {
+            request_id: 11,
+            command: Command::Get,
+            payload: RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"k".to_vec(),
+            },
+        };
+        let mut buffer = vec![0xff; 256];
+        let capacity = buffer.capacity();
+
+        encode_request_frame_into(&request, &mut buffer);
+
+        assert!(buffer.len() < 256);
+        assert_eq!(buffer.capacity(), capacity);
+        assert_eq!(
+            decode_request_frame(&buffer, MAX_PAYLOAD).expect("request frame"),
+            request
+        );
+
+        let response = ResponseFrame {
+            request_id: 11,
+            command: Command::Get,
+            payload: ResponsePayload::Miss,
+        };
+        encode_response_frame_into(&response, &mut buffer);
+
+        assert!(buffer.len() < 256);
+        assert_eq!(buffer.capacity(), capacity);
+        assert_eq!(
+            decode_response_frame(&buffer, MAX_PAYLOAD).expect("response frame"),
+            response
+        );
     }
 
     #[test]

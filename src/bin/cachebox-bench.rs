@@ -9,7 +9,7 @@ use cachebox::config::Config;
 use cachebox::engine::{Engine, GetOutcome, PutCommand};
 use cachebox::protocol::{
     BatchItem, Command, HEADER_LEN, Metadata, RequestFrame, RequestPayload, ResponsePayload,
-    decode_response_frame, encode_request_frame,
+    decode_response_frame, encode_request_frame_into,
 };
 use cachebox::server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -666,6 +666,8 @@ struct NativeClient {
     stream: NativeClientStream,
     transport: &'static str,
     next_request_id: u64,
+    request_buffer: Vec<u8>,
+    response_buffer: Vec<u8>,
 }
 
 enum NativeClientStream {
@@ -684,6 +686,8 @@ impl NativeClient {
                         stream: NativeClientStream::Tcp(stream),
                         transport: "loopback_tcp",
                         next_request_id: 1,
+                        request_buffer: Vec::new(),
+                        response_buffer: Vec::new(),
                     };
                 }
                 Err(_) if Instant::now() < deadline => {
@@ -704,6 +708,8 @@ impl NativeClient {
                         stream: NativeClientStream::Unix(stream),
                         transport: "loopback_unix",
                         next_request_id: 1,
+                        request_buffer: Vec::new(),
+                        response_buffer: Vec::new(),
                     };
                 }
                 Err(_) if Instant::now() < deadline => {
@@ -722,30 +728,31 @@ impl NativeClient {
             command,
             payload,
         };
-        self.write_all(&encode_request_frame(&frame)).await;
+        encode_request_frame_into(&frame, &mut self.request_buffer);
+        self.write_all_request_buffer().await;
 
         let mut header = [0u8; HEADER_LEN];
         self.read_exact(&mut header).await;
         let payload_len =
             u32::from_be_bytes(header[16..20].try_into().expect("header payload length")) as usize;
-        let mut response = Vec::with_capacity(HEADER_LEN + payload_len);
-        response.extend_from_slice(&header);
-        let start = response.len();
-        response.resize(HEADER_LEN + payload_len, 0);
-        self.read_exact(&mut response[start..]).await;
+        self.response_buffer.clear();
+        self.response_buffer.extend_from_slice(&header);
+        let start = self.response_buffer.len();
+        self.response_buffer.resize(HEADER_LEN + payload_len, 0);
+        self.read_response_payload(start).await;
 
-        let response =
-            decode_response_frame(&response, usize::MAX).expect("native response should decode");
+        let response = decode_response_frame(&self.response_buffer, usize::MAX)
+            .expect("native response should decode");
         assert_eq!(response.request_id, request_id);
         assert_eq!(response.command, command);
         response.payload
     }
 
-    async fn write_all(&mut self, bytes: &[u8]) {
+    async fn write_all_request_buffer(&mut self) {
         match &mut self.stream {
-            NativeClientStream::Tcp(stream) => stream.write_all(bytes).await,
+            NativeClientStream::Tcp(stream) => stream.write_all(&self.request_buffer).await,
             #[cfg(unix)]
-            NativeClientStream::Unix(stream) => stream.write_all(bytes).await,
+            NativeClientStream::Unix(stream) => stream.write_all(&self.request_buffer).await,
         }
         .expect("native write");
     }
@@ -755,6 +762,19 @@ impl NativeClient {
             NativeClientStream::Tcp(stream) => stream.read_exact(bytes).await,
             #[cfg(unix)]
             NativeClientStream::Unix(stream) => stream.read_exact(bytes).await,
+        }
+        .expect("native read");
+    }
+
+    async fn read_response_payload(&mut self, start: usize) {
+        match &mut self.stream {
+            NativeClientStream::Tcp(stream) => {
+                stream.read_exact(&mut self.response_buffer[start..]).await
+            }
+            #[cfg(unix)]
+            NativeClientStream::Unix(stream) => {
+                stream.read_exact(&mut self.response_buffer[start..]).await
+            }
         }
         .expect("native read");
     }
