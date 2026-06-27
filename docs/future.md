@@ -205,8 +205,10 @@ WASM may be considered, but only after the built-in policy model is mature.
 
 ### Phase 4: AI-Native Capabilities
 
+- Documented AI use of reserved cost metadata.
 - Prompt/result cache helpers.
 - Embedding cache helpers.
+- Generation lease helpers.
 - Token-cost-aware eviction.
 - Streaming response cache.
 - Content-addressed blob dedupe.

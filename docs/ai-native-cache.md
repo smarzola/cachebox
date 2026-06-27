@@ -241,11 +241,28 @@ until request-scoped stale controls are implemented.
 
 After the general MVP is hardened, the best AI-specific first features are:
 
-1. Client-side prompt cache key helpers.
-2. Token-cost metadata on writes.
-3. Cost-aware eviction policy experiment.
-4. Streaming response capture behind an experimental endpoint.
-5. Embedding cache key helpers.
+1. Documented AI use of `Cachebox-Cost`.
+2. Client-side prompt cache key helpers.
+3. Embedding cache key helpers.
+4. Lease helper for generation refresh.
+5. Cost-aware admission or eviction policy experiment.
+6. Streaming response capture behind an experimental helper or endpoint.
 
 These build directly on existing Cachebox primitives instead of widening the
 server into a model platform.
+
+Early success criteria:
+
+- Cost metadata is accepted, documented for AI workloads, visible in tests, and
+  not used for eviction until an experiment proves the policy.
+- Prompt keys are deterministic across supported clients for equivalent
+  provider, model, prompt, tool, sampling, retrieval, output format, and
+  namespace inputs.
+- Embedding keys change when model, version, input content hash, normalization,
+  chunking, or dimensions change.
+- Generation helpers use existing lease states to ensure only one client
+  recomputes a missing or stale expensive result under normal contention.
+- Cost-aware policy experiments include reproducible benchmark commands before
+  any default behavior changes.
+- Streaming capture starts with buffer-then-commit semantics, so failed
+  generations do not publish partial values by default.
