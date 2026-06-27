@@ -25,14 +25,15 @@ fn main() {
         bench_tag_invalidation(&server),
         bench_ttl_heavy_writes(&server),
         bench_eviction_pressure(&eviction_server),
+        bench_cost_shaped_writes(&server),
     ];
 
     println!(
-        "scenario transport iterations p50_ns p95_ns p99_ns throughput_ops_s memory_used_bytes notes"
+        "scenario transport iterations p50_ns p95_ns p99_ns throughput_ops_s memory_used_bytes cost_score_total notes"
     );
     for scenario in scenarios {
         println!(
-            "{} {} {} {} {} {} {:.2} {} {}",
+            "{} {} {} {} {} {} {:.2} {} {} {}",
             scenario.name,
             scenario.transport,
             scenario.iterations,
@@ -41,6 +42,7 @@ fn main() {
             scenario.p99_ns,
             scenario.throughput_ops_s,
             scenario.memory_used_bytes,
+            scenario.cost_score_total,
             scenario.notes
         );
     }
@@ -233,6 +235,23 @@ fn bench_eviction_pressure(server: &LoopbackServer) -> BenchResult {
     with_memory(result, server.memory_used_bytes())
 }
 
+fn bench_cost_shaped_writes(server: &LoopbackServer) -> BenchResult {
+    let mut index = 0usize;
+    warmup(|| {
+        cost_shaped_round(server, index);
+        index += 1;
+    });
+    let result = measure(
+        "cost_shaped_writes",
+        "cheap_large_expensive_small_mixed_ttl",
+        || {
+            cost_shaped_round(server, index);
+            index += 1;
+        },
+    );
+    with_metrics(result, server)
+}
+
 fn tag_invalidation_round(server: &LoopbackServer, index: usize) {
     let tag = format!("tag-{index}");
     for item in 0..8 {
@@ -258,6 +277,30 @@ fn tag_invalidation_round(server: &LoopbackServer, index: usize) {
         ),
         200,
     );
+}
+
+fn cost_shaped_round(server: &LoopbackServer, index: usize) {
+    let large_value = [b'x'; 512];
+    let writes = [
+        (
+            format!("/v1/namespaces/bench/keys/cost-large-{index}"),
+            vec![("Cachebox-Cost", "1")],
+            large_value.as_slice(),
+        ),
+        (
+            format!("/v1/namespaces/bench/keys/cost-small-{index}"),
+            vec![("Cachebox-Cost", "1000")],
+            b"x".as_slice(),
+        ),
+        (
+            format!("/v1/namespaces/bench/keys/cost-ttl-{index}"),
+            vec![("Cachebox-Cost", "500"), ("Cachebox-TTL", "60s")],
+            b"ttl".as_slice(),
+        ),
+    ];
+    for (path, headers, body) in writes {
+        assert_status(request("PUT", &server.addr, &path, &headers, body), 201);
+    }
 }
 
 fn warmup(mut operation: impl FnMut()) {
@@ -295,6 +338,7 @@ fn summarize(
         p99_ns: percentile_ns(&samples, 99),
         throughput_ops_s: iterations as f64 / elapsed.as_secs_f64(),
         memory_used_bytes,
+        cost_score_total: 0,
         notes,
     }
 }
@@ -306,6 +350,12 @@ fn percentile_ns(samples: &[Duration], percentile: usize) -> u128 {
 
 fn with_memory(mut result: BenchResult, memory_used_bytes: usize) -> BenchResult {
     result.memory_used_bytes = memory_used_bytes;
+    result
+}
+
+fn with_metrics(mut result: BenchResult, server: &LoopbackServer) -> BenchResult {
+    result.memory_used_bytes = server.memory_used_bytes();
+    result.cost_score_total = server.cost_score_total();
     result
 }
 
@@ -353,6 +403,13 @@ impl LoopbackServer {
         assert_eq!(response.status, 200);
         let body = String::from_utf8(response.body).expect("metrics utf-8");
         metric_value(&body, "cachebox_memory_used_bytes")
+    }
+
+    fn cost_score_total(&self) -> usize {
+        let response = request("GET", &self.addr, "/metrics", &[], &[]);
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).expect("metrics utf-8");
+        metric_value(&body, "cachebox_cost_score_total")
     }
 }
 
@@ -455,5 +512,6 @@ struct BenchResult {
     p99_ns: u128,
     throughput_ops_s: f64,
     memory_used_bytes: usize,
+    cost_score_total: usize,
     notes: &'static str,
 }

@@ -38,6 +38,7 @@ where
     tag_index: HashMap<TagId, HashSet<EntryId>>,
     limits: EngineLimits,
     memory_used_bytes: usize,
+    cost_score_total: u64,
     next_access: u64,
     stats: EngineStats,
 }
@@ -74,6 +75,7 @@ where
             tag_index: HashMap::new(),
             limits,
             memory_used_bytes: 0,
+            cost_score_total: 0,
             next_access: 0,
             stats: EngineStats::default(),
         }
@@ -141,11 +143,15 @@ where
                 expires_at_ms,
                 stale_until_ms,
                 tags,
+                cost: command.cost,
                 memory_bytes: entry_memory_bytes,
                 last_access,
             },
         );
         self.memory_used_bytes = self.memory_used_bytes.saturating_add(entry_memory_bytes);
+        self.cost_score_total = self
+            .cost_score_total
+            .saturating_add(command.cost.unwrap_or(0));
         Ok(PutOutcome { evicted })
     }
 
@@ -281,6 +287,7 @@ where
             ttl: command.ttl,
             stale_ttl: command.stale_ttl,
             tags: command.tags,
+            cost: command.cost,
         })
         .map_err(CompleteLeaseError::Put)
     }
@@ -297,6 +304,11 @@ where
     pub fn memory_used_bytes(&mut self) -> usize {
         self.remove_expired();
         self.memory_used_bytes
+    }
+
+    pub fn cost_score_total(&mut self) -> u64 {
+        self.remove_expired();
+        self.cost_score_total
     }
 
     pub fn limits(&self) -> EngineLimits {
@@ -342,6 +354,9 @@ where
         };
         self.leases.remove(id);
         self.memory_used_bytes = self.memory_used_bytes.saturating_sub(entry.memory_bytes);
+        self.cost_score_total = self
+            .cost_score_total
+            .saturating_sub(entry.cost.unwrap_or(0));
 
         for tag in entry.tags {
             let tag_id = TagId {
@@ -474,6 +489,7 @@ pub struct CompleteLeaseCommand {
     pub ttl: Option<Ttl>,
     pub stale_ttl: Option<Ttl>,
     pub tags: Vec<String>,
+    pub cost: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,6 +519,7 @@ pub struct PutCommand {
     pub ttl: Option<Ttl>,
     pub stale_ttl: Option<Ttl>,
     pub tags: Vec<String>,
+    pub cost: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,6 +556,7 @@ struct Entry {
     expires_at_ms: Option<u64>,
     stale_until_ms: Option<u64>,
     tags: Vec<String>,
+    cost: Option<u64>,
     memory_bytes: usize,
     last_access: u64,
 }
@@ -628,6 +646,7 @@ mod tests {
             ttl: None,
             stale_ttl: None,
             tags: Vec::new(),
+            cost: None,
         }
     }
 
@@ -866,6 +885,31 @@ mod tests {
     }
 
     #[test]
+    fn cost_score_total_tracks_live_entries() {
+        let (mut engine, clock) = engine();
+        let mut first = put("default", b"a", b"value");
+        first.cost = Some(10);
+        engine.put(first).expect("put should fit");
+
+        let mut second = put("default", b"b", b"value");
+        second.cost = Some(7);
+        second.ttl = Some(Ttl { milliseconds: 10 });
+        engine.put(second).expect("put should fit");
+        assert_eq!(engine.cost_score_total(), 17);
+
+        let mut replacement = put("default", b"a", b"value");
+        replacement.cost = Some(3);
+        engine.put(replacement).expect("put should fit");
+        assert_eq!(engine.cost_score_total(), 10);
+
+        assert!(engine.delete("default", b"a"));
+        assert_eq!(engine.cost_score_total(), 7);
+
+        clock.advance(11);
+        assert_eq!(engine.cost_score_total(), 0);
+    }
+
+    #[test]
     fn reclaims_expired_entries_before_evicting_live_entries() {
         let (mut engine, clock) = tiny_engine(240, 1_000);
         let mut expiring = put("default", b"old", b"1111111111");
@@ -920,6 +964,7 @@ mod tests {
                 ttl: Some(Ttl { milliseconds: 100 }),
                 stale_ttl: None,
                 tags: Vec::new(),
+                cost: None,
             })
             .expect("lease completion should put value");
 
@@ -962,6 +1007,7 @@ mod tests {
                 ttl: Some(Ttl { milliseconds: 100 }),
                 stale_ttl: None,
                 tags: Vec::new(),
+                cost: None,
             })
             .expect("lease completion should refresh value");
         assert_eq!(
@@ -996,6 +1042,7 @@ mod tests {
                 ttl: None,
                 stale_ttl: None,
                 tags: Vec::new(),
+                cost: None,
             })
             .expect_err("old token should fail");
         assert_eq!(error, CompleteLeaseError::InvalidLeaseToken);

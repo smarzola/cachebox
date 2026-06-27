@@ -168,7 +168,9 @@ The current engine implements the in-memory path with an injectable clock. It
 stores byte keys and values per namespace, returns distinct fresh, stale, and
 miss outcomes, removes expired entries lazily, and keeps tag indexes scoped by
 namespace. It also tracks estimated memory use and enforces configured memory
-and value-size limits.
+and value-size limits. `Cachebox-Cost` is stored as optional entry metadata and
+exposed as aggregate live cost score for experiments, but it does not affect the
+default eviction policy.
 
 Eviction:
 

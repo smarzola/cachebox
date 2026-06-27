@@ -234,6 +234,7 @@ fn execute_operation(state: AppState, operation: Operation) -> Response {
                     ttl: metadata.ttl,
                     stale_ttl: metadata.stale_ttl,
                     tags: metadata.tags,
+                    cost: metadata.cost,
                 });
             match result {
                 Ok(_) => HttpStatusCode::CREATED.into_response(),
@@ -344,6 +345,7 @@ fn execute_operation(state: AppState, operation: Operation) -> Response {
                     ttl: metadata.ttl,
                     stale_ttl: metadata.stale_ttl,
                     tags: metadata.tags,
+                    cost: metadata.cost,
                 });
             match result {
                 Ok(_) => HttpStatusCode::CREATED.into_response(),
@@ -372,6 +374,7 @@ fn metrics_response(state: &AppState) -> Response {
     let mut engine = state.engine.lock().expect("engine mutex poisoned");
     let engine_stats = engine.stats();
     let memory_used_bytes = engine.memory_used_bytes();
+    let cost_score_total = engine.cost_score_total();
     let limits = engine.limits();
 
     let body = format!(
@@ -398,6 +401,7 @@ cachebox_expirations_total {}
 cachebox_evictions_total {}
 cachebox_memory_used_bytes {}
 cachebox_memory_limit_bytes {}
+cachebox_cost_score_total {}
 cachebox_connections_current 0
 ",
         snapshot.requests_total,
@@ -417,7 +421,8 @@ cachebox_connections_current 0
         engine_stats.expirations,
         engine_stats.evictions,
         memory_used_bytes,
-        limits.max_memory_bytes
+        limits.max_memory_bytes,
+        cost_score_total
     );
 
     (
@@ -964,6 +969,38 @@ mod tests {
         assert!(body.contains("cachebox_evictions_total 1"));
         assert!(body.contains("cachebox_memory_limit_bytes 240"));
         assert!(body.contains("cachebox_connections_current 0"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reports_live_cost_score_total() {
+        let app = app(&Config::default());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/namespaces/default/keys/expensive")
+                    .header("Cachebox-Cost", "99")
+                    .body(Body::from("value"))
+                    .expect("request"),
+            )
+            .await
+            .expect("put response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("metrics response");
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let body = String::from_utf8(response_bytes(metrics).await).expect("metrics utf-8");
+        assert!(body.contains("cachebox_cost_score_total 99"));
     }
 
     #[tokio::test]

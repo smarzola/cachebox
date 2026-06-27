@@ -79,9 +79,9 @@ Metadata:
 
 - Token input count.
 - Token output count.
-- Estimated or user-provided cost. The server already accepts `Cachebox-Cost`
-  as a reserved unsigned integer, but the current eviction policy does not use
-  it.
+- Estimated or user-provided cost. The server accepts `Cachebox-Cost` as an
+  unsigned integer and exposes the live aggregate as `cachebox_cost_score_total`,
+  but the current eviction policy does not use it.
 - Latency saved.
 - Safety or policy version.
 - Model fingerprint.
@@ -215,7 +215,8 @@ Eviction score can combine:
 - Namespace quota pressure.
 
 The default should be simple and safe. Cost-aware policies should be opt-in until
-they are well understood.
+they are well understood. Current support is limited to storing cost metadata,
+exposing aggregate cost metrics, and benchmarking cost-shaped workloads.
 
 ## AI-Specific Tags
 
