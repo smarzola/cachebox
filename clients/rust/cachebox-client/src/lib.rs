@@ -1,5 +1,7 @@
 //! Minimal native socket client.
 
+pub mod ai;
+
 use std::collections::HashMap;
 use std::fmt;
 

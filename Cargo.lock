@@ -76,7 +76,6 @@ dependencies = [
  "cachebox-protocol",
  "http",
  "http-body-util",
- "serde_json",
  "tokio",
  "tower",
 ]
@@ -86,6 +85,7 @@ name = "cachebox-client"
 version = "0.1.0"
 dependencies = [
  "cachebox-protocol",
+ "serde_json",
  "tokio",
 ]
 

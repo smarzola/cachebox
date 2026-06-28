@@ -42,7 +42,7 @@ Applications should be able to cache model outputs using normalized request
 metadata.
 
 The Rust crate includes a provider-neutral prompt/result key helper in
-`cachebox::ai`. It turns structured prompt request fields into an ASCII byte key
+`cachebox_client::ai`. It turns structured prompt request fields into an ASCII byte key
 with the prefix `ai:prompt:v1:`.
 
 Cache key inputs:
@@ -91,7 +91,7 @@ Metadata:
 Embedding generation is a strong cache candidate because inputs are often
 repeated across indexing, RAG, and local automation workflows.
 
-The Rust crate includes `cachebox::ai::embedding_cache_key`, which builds
+The Rust client crate includes `cachebox_client::ai::embedding_cache_key`, which builds
 deterministic ASCII byte keys with the prefix `ai:embedding:v1:`. It only builds
 cache keys; it does not perform embedding generation or similarity search.
 
@@ -146,7 +146,7 @@ capture streamed chunks in the client, return them to the caller as they arrive,
 and complete the Cachebox lease with one raw-byte value only after generation
 succeeds.
 
-The Rust crate includes `cachebox::ai::StreamCapture` for this conservative
+The Rust client crate includes `cachebox_client::ai::StreamCapture` for this conservative
 path. It buffers raw chunks client-side, concatenates them into one value on
 successful completion, and refuses to produce a value after generation is marked
 failed. Cachebox still stores and replays the result as ordinary raw bytes; no
@@ -268,7 +268,7 @@ request parses `allow_stale_ms`, but the server does not apply that field yet;
 helpers should treat stale serving as controlled by the entry's stored stale TTL
 until request-scoped stale controls are implemented.
 
-The Rust crate includes `cachebox::ai::generation_lease_action`, a small helper
+The Rust client crate includes `cachebox_client::ai::generation_lease_action`, a small helper
 that maps lease start outcomes into generation decisions:
 
 - `hit` returns the fresh cached value.

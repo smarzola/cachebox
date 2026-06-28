@@ -48,20 +48,20 @@ Put and lease completion accept:
 
 ## AI Helpers
 
-- `cachebox::ai::prompt_cache_key` builds deterministic ASCII byte keys for
+- `cachebox_client::ai::prompt_cache_key` builds deterministic ASCII byte keys for
   prompt/result cache entries.
 - Prompt key normalization includes provider, model, optional model version,
   message list, optional system prompt, optional tool schema, sampling
   parameters, optional output format, optional retrieval context hash, and
   application namespace.
-- `cachebox::ai::embedding_cache_key` builds deterministic ASCII byte keys for
+- `cachebox_client::ai::embedding_cache_key` builds deterministic ASCII byte keys for
   embedding cache entries.
 - Embedding key normalization includes model, optional model version, input
   content hash, normalization settings, chunking strategy, dimensions, and
   application namespace.
-- `cachebox::ai::generation_lease_action` maps lease start states into client
+- `cachebox_client::ai::generation_lease_action` maps lease start states into client
   actions: return cached bytes, generate with a lease token, or retry later.
-- `cachebox::ai::StreamCapture` supports experimental client-side
+- `cachebox_client::ai::StreamCapture` supports experimental client-side
   buffer-then-commit capture for streamed generation bytes.
 - The helper is provider-neutral and does not call model APIs.
 
