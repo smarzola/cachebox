@@ -1191,7 +1191,7 @@ mod tests {
                     namespace: "default".to_string(),
                     key: key.to_vec(),
                     value: b"value".to_vec(),
-                    ttl: Some(crate::api::Ttl { milliseconds: 1 }),
+                    ttl: Some(cachebox_protocol::Ttl { milliseconds: 1 }),
                     stale_ttl: None,
                     tags: Vec::new(),
                     cost: None,
@@ -1323,13 +1323,13 @@ mod tests {
                     namespace: "default".to_string(),
                     key: b"k".to_vec(),
                     metadata: Metadata {
-                        ttl: Some(crate::api::Ttl {
+                        ttl: Some(cachebox_protocol::Ttl {
                             milliseconds: 60_000,
                         }),
                         stale_ttl: None,
                         cost: Some(7),
                         tags: vec!["group".to_string()],
-                        content_type: crate::api::ContentType::OctetStream,
+                        content_type: cachebox_protocol::ContentType::OctetStream,
                     },
                     value: b"value".to_vec(),
                 },
@@ -1713,7 +1713,7 @@ mod tests {
                     key: b"lease-key".to_vec(),
                     lease_token: token,
                     metadata: Metadata {
-                        ttl: Some(crate::api::Ttl {
+                        ttl: Some(cachebox_protocol::Ttl {
                             milliseconds: 60_000,
                         }),
                         ..Metadata::default()

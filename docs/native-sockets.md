@@ -37,9 +37,8 @@ This example uses the native client API over a Unix socket. Use
 `NativeClient::connect_tcp("127.0.0.1:7401")` for TCP.
 
 ```rust
-use cachebox::api::Ttl;
-use cachebox::client::NativeClient;
-use cachebox::protocol::{BatchItem, Metadata, ResponsePayload};
+use cachebox::protocol::{Metadata, ResponsePayload, Ttl};
+use cachebox_client::{GetResult, LeaseStartResult, NativeClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let hit = client.get("default", b"user:123".to_vec()).await?;
-    assert_eq!(hit, ResponsePayload::Hit(b"cached bytes".to_vec()));
+    assert_eq!(hit, GetResult::Hit(b"cached bytes".to_vec()));
 
     let batch = client
         .batch_get(
@@ -75,8 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         batch,
         vec![
-            BatchItem::Hit(b"cached bytes".to_vec()),
-            BatchItem::Miss,
+            GetResult::Hit(b"cached bytes".to_vec()),
+            GetResult::Miss,
         ]
     );
 
@@ -110,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .start_lease("default", b"expensive".to_vec(), 10_000, None)
         .await?;
     let token = match lease {
-        ResponsePayload::LeaseGranted { lease_token, .. } => lease_token,
+        LeaseStartResult::LeaseGranted { lease_token, .. } => lease_token,
         other => panic!("expected lease grant, got {other:?}"),
     };
 

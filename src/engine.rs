@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::api::Ttl;
+use cachebox_protocol::Ttl;
 
 const ENTRY_OVERHEAD_BYTES: usize = 96;
 const LRU_SAMPLE_SIZE: usize = 16;

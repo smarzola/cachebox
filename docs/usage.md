@@ -11,9 +11,8 @@ get from each feature.
 All Rust examples use:
 
 ```rust
-use cachebox::api::Ttl;
-use cachebox::client::NativeClient;
-use cachebox::protocol::{BatchItem, Command, Metadata, RequestPayload, ResponsePayload};
+use cachebox::protocol::{Command, Metadata, RequestPayload, ResponsePayload, Ttl};
+use cachebox_client::{GetResult, LeaseStartResult, NativeClient};
 ```
 
 Connect over TCP:
@@ -108,18 +107,17 @@ Use `get` when you want one key:
 let response = client.get("default", b"dashboard:42".to_vec()).await?;
 
 match response {
-    ResponsePayload::Hit(bytes) => {
+    GetResult::Hit(bytes) => {
         // Fresh value.
         let _ = bytes;
     }
-    ResponsePayload::Stale(bytes) => {
+    GetResult::Stale(bytes) => {
         // Still readable, but a refresh should be considered.
         let _ = bytes;
     }
-    ResponsePayload::Miss => {
+    GetResult::Miss => {
         // Nothing readable exists.
     }
-    other => panic!("unexpected get response: {other:?}"),
 }
 ```
 
@@ -155,13 +153,13 @@ let items = client
 
 for item in items {
     match item {
-        BatchItem::Hit(bytes) => {
+        GetResult::Hit(bytes) => {
             let _ = bytes;
         }
-        BatchItem::Stale(bytes) => {
+        GetResult::Stale(bytes) => {
             let _ = bytes;
         }
-        BatchItem::Miss => {}
+        GetResult::Miss => {}
     }
 }
 ```
@@ -259,15 +257,15 @@ Handle the possible states:
 
 ```rust
 match response {
-    ResponsePayload::Hit(bytes) => {
+    LeaseStartResult::Hit(bytes) => {
         // Fresh value already exists.
         let _ = bytes;
     }
-    ResponsePayload::Stale(bytes) => {
+    LeaseStartResult::Stale(bytes) => {
         // Another client owns the refresh lease; serve stale bytes if acceptable.
         let _ = bytes;
     }
-    ResponsePayload::LeaseGranted {
+    LeaseStartResult::LeaseGranted {
         lease_token,
         stale_value,
     } => {
@@ -293,10 +291,9 @@ match response {
             )
             .await?;
     }
-    ResponsePayload::LeaseDenied => {
+    LeaseStartResult::LeaseDenied => {
         // Another client owns an active lease and no stale value is available.
     }
-    other => panic!("unexpected lease response: {other:?}"),
 }
 ```
 
@@ -369,7 +366,7 @@ The native client returns structured server errors as `ClientError::Server`:
 
 ```rust
 match client.get("bad namespace!", b"k".to_vec()).await {
-    Err(cachebox::client::ClientError::Server { code, message }) => {
+    Err(cachebox_client::ClientError::Server { code, message }) => {
         let _ = (code, message);
     }
     other => panic!("unexpected result: {other:?}"),
