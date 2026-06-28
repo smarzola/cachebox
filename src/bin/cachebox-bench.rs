@@ -60,7 +60,7 @@ fn main() {
 
 async fn async_main() {
     let native_server = NativeLoopbackServer::start(Config::default());
-    let mut native_client = NativeClient::connect_tcp(&native_server.addr).await;
+    let mut native_client = RawNativeBenchClient::connect_tcp(&native_server.addr).await;
     let mut official_client = OfficialNativeClient::connect_tcp(&native_server.addr)
         .await
         .expect("official native tcp client");
@@ -96,7 +96,8 @@ async fn async_main() {
     #[cfg(unix)]
     {
         let native_unix_server = NativeUnixLoopbackServer::start(Config::default());
-        let mut native_unix_client = NativeClient::connect_unix(&native_unix_server.path).await;
+        let mut native_unix_client =
+            RawNativeBenchClient::connect_unix(&native_unix_server.path).await;
         let mut official_unix_client = OfficialNativeClient::connect_unix(&native_unix_server.path)
             .await
             .expect("official native unix client");
@@ -423,7 +424,7 @@ async fn bench_tokio_spawn_mpsc_response() -> BenchResult {
     )
 }
 
-async fn bench_native_single_key_get(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_single_key_get(client: &mut RawNativeBenchClient) -> BenchResult {
     assert_eq!(
         client
             .request(
@@ -451,7 +452,7 @@ async fn bench_native_single_key_get(client: &mut NativeClient) -> BenchResult {
     })
 }
 
-async fn bench_native_single_key_put(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_single_key_put(client: &mut RawNativeBenchClient) -> BenchResult {
     let mut index = 0usize;
     warmup_async!({
         let key = format!("native-put-warmup-{index}");
@@ -481,7 +482,7 @@ async fn bench_native_single_key_put(client: &mut NativeClient) -> BenchResult {
     })
 }
 
-async fn bench_native_batch_get(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_batch_get(client: &mut RawNativeBenchClient) -> BenchResult {
     for index in 0..32 {
         let key = format!("native-batch-{index}");
         assert_eq!(
@@ -505,7 +506,7 @@ async fn bench_native_batch_get(client: &mut NativeClient) -> BenchResult {
     })
 }
 
-async fn bench_native_lease_contention(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_lease_contention(client: &mut RawNativeBenchClient) -> BenchResult {
     assert!(matches!(
         client
             .request(
@@ -554,7 +555,7 @@ async fn bench_native_lease_contention(client: &mut NativeClient) -> BenchResult
     })
 }
 
-async fn bench_native_tag_invalidate_empty(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_tag_invalidate_empty(client: &mut RawNativeBenchClient) -> BenchResult {
     warmup_async!({
         assert_eq!(
             client
@@ -579,7 +580,7 @@ async fn bench_native_tag_invalidate_empty(client: &mut NativeClient) -> BenchRe
     })
 }
 
-async fn bench_native_tag_invalidate_8(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_tag_invalidate_8(client: &mut RawNativeBenchClient) -> BenchResult {
     let mut index = 0usize;
     warmup_async!({
         let tag = native_put_tagged_values(client, index).await;
@@ -606,7 +607,7 @@ async fn bench_native_tag_invalidate_8(client: &mut NativeClient) -> BenchResult
     )
 }
 
-async fn bench_native_tag_invalidation(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_tag_invalidation(client: &mut RawNativeBenchClient) -> BenchResult {
     let mut index = 0usize;
     warmup_async!({
         native_tag_invalidation_round(client, index).await;
@@ -623,7 +624,7 @@ async fn bench_native_tag_invalidation(client: &mut NativeClient) -> BenchResult
     )
 }
 
-async fn bench_native_ttl_heavy_writes(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_ttl_heavy_writes(client: &mut RawNativeBenchClient) -> BenchResult {
     let mut index = 0usize;
     warmup_async!({
         let key = format!("native-ttl-warmup-{index}");
@@ -653,7 +654,7 @@ async fn bench_native_ttl_heavy_writes(client: &mut NativeClient) -> BenchResult
     })
 }
 
-async fn bench_native_pipelined_get(client: &mut NativeClient) -> BenchResult {
+async fn bench_native_pipelined_get(client: &mut RawNativeBenchClient) -> BenchResult {
     assert_eq!(
         client
             .request(
@@ -685,7 +686,7 @@ async fn bench_native_pipelined_get(client: &mut NativeClient) -> BenchResult {
     )
 }
 
-async fn native_pipelined_get_round(client: &mut NativeClient) {
+async fn native_pipelined_get_round(client: &mut RawNativeBenchClient) {
     let mut expected_ids = Vec::with_capacity(PIPELINE_DEPTH);
     for _ in 0..PIPELINE_DEPTH {
         let request_id = client
@@ -814,13 +815,13 @@ async fn official_pipelined_get_32_round(client: &mut OfficialNativeClient, key:
 }
 
 async fn bench_native_concurrent_get_tcp(addr: &str) -> BenchResult {
-    let mut setup = NativeClient::connect_tcp(addr).await;
+    let mut setup = RawNativeBenchClient::connect_tcp(addr).await;
     let addr = addr.to_string();
     bench_native_concurrent_get(
         "loopback_tcp",
         move || {
             let addr = addr.clone();
-            async move { NativeClient::connect_tcp(&addr).await }
+            async move { RawNativeBenchClient::connect_tcp(&addr).await }
         },
         &mut setup,
     )
@@ -828,13 +829,13 @@ async fn bench_native_concurrent_get_tcp(addr: &str) -> BenchResult {
 }
 
 async fn bench_native_concurrent_get_distinct_tcp(addr: &str) -> BenchResult {
-    let mut setup = NativeClient::connect_tcp(addr).await;
+    let mut setup = RawNativeBenchClient::connect_tcp(addr).await;
     let addr = addr.to_string();
     bench_native_concurrent_get_distinct(
         "loopback_tcp",
         move || {
             let addr = addr.clone();
-            async move { NativeClient::connect_tcp(&addr).await }
+            async move { RawNativeBenchClient::connect_tcp(&addr).await }
         },
         &mut setup,
     )
@@ -843,13 +844,13 @@ async fn bench_native_concurrent_get_distinct_tcp(addr: &str) -> BenchResult {
 
 #[cfg(unix)]
 async fn bench_native_concurrent_get_unix(path: &Path) -> BenchResult {
-    let mut setup = NativeClient::connect_unix(path).await;
+    let mut setup = RawNativeBenchClient::connect_unix(path).await;
     let path = path.to_path_buf();
     bench_native_concurrent_get(
         "loopback_unix",
         move || {
             let path = path.clone();
-            async move { NativeClient::connect_unix(&path).await }
+            async move { RawNativeBenchClient::connect_unix(&path).await }
         },
         &mut setup,
     )
@@ -858,13 +859,13 @@ async fn bench_native_concurrent_get_unix(path: &Path) -> BenchResult {
 
 #[cfg(unix)]
 async fn bench_native_concurrent_get_distinct_unix(path: &Path) -> BenchResult {
-    let mut setup = NativeClient::connect_unix(path).await;
+    let mut setup = RawNativeBenchClient::connect_unix(path).await;
     let path = path.to_path_buf();
     bench_native_concurrent_get_distinct(
         "loopback_unix",
         move || {
             let path = path.clone();
-            async move { NativeClient::connect_unix(&path).await }
+            async move { RawNativeBenchClient::connect_unix(&path).await }
         },
         &mut setup,
     )
@@ -875,7 +876,7 @@ async fn bench_native_concurrent_put_tcp(addr: &str) -> BenchResult {
     let addr = addr.to_string();
     bench_native_concurrent_put("loopback_tcp", move || {
         let addr = addr.clone();
-        async move { NativeClient::connect_tcp(&addr).await }
+        async move { RawNativeBenchClient::connect_tcp(&addr).await }
     })
     .await
 }
@@ -885,19 +886,19 @@ async fn bench_native_concurrent_put_unix(path: &Path) -> BenchResult {
     let path = path.to_path_buf();
     bench_native_concurrent_put("loopback_unix", move || {
         let path = path.clone();
-        async move { NativeClient::connect_unix(&path).await }
+        async move { RawNativeBenchClient::connect_unix(&path).await }
     })
     .await
 }
 
 async fn bench_native_short_connection_get_tcp(addr: &str) -> BenchResult {
-    let mut setup = NativeClient::connect_tcp(addr).await;
+    let mut setup = RawNativeBenchClient::connect_tcp(addr).await;
     let addr = addr.to_string();
     bench_native_short_connection_get(
         "loopback_tcp",
         move || {
             let addr = addr.clone();
-            async move { NativeClient::connect_tcp(&addr).await }
+            async move { RawNativeBenchClient::connect_tcp(&addr).await }
         },
         &mut setup,
     )
@@ -906,13 +907,13 @@ async fn bench_native_short_connection_get_tcp(addr: &str) -> BenchResult {
 
 #[cfg(unix)]
 async fn bench_native_short_connection_get_unix(path: &Path) -> BenchResult {
-    let mut setup = NativeClient::connect_unix(path).await;
+    let mut setup = RawNativeBenchClient::connect_unix(path).await;
     let path = path.to_path_buf();
     bench_native_short_connection_get(
         "loopback_unix",
         move || {
             let path = path.clone();
-            async move { NativeClient::connect_unix(&path).await }
+            async move { RawNativeBenchClient::connect_unix(&path).await }
         },
         &mut setup,
     )
@@ -922,11 +923,11 @@ async fn bench_native_short_connection_get_unix(path: &Path) -> BenchResult {
 async fn bench_native_concurrent_get<F, Fut>(
     transport: &'static str,
     connect: F,
-    setup: &mut NativeClient,
+    setup: &mut RawNativeBenchClient,
 ) -> BenchResult
 where
     F: Fn() -> Fut + Clone + Send + Sync + 'static,
-    Fut: std::future::Future<Output = NativeClient> + Send + 'static,
+    Fut: std::future::Future<Output = RawNativeBenchClient> + Send + 'static,
 {
     assert_eq!(
         setup
@@ -972,11 +973,11 @@ where
 async fn bench_native_concurrent_get_distinct<F, Fut>(
     transport: &'static str,
     connect: F,
-    setup: &mut NativeClient,
+    setup: &mut RawNativeBenchClient,
 ) -> BenchResult
 where
     F: Fn() -> Fut + Clone + Send + Sync + 'static,
-    Fut: std::future::Future<Output = NativeClient> + Send + 'static,
+    Fut: std::future::Future<Output = RawNativeBenchClient> + Send + 'static,
 {
     for client_index in 0..CONCURRENT_CLIENTS {
         let key = format!("concurrent-get-distinct-{client_index}");
@@ -1026,7 +1027,7 @@ where
 async fn bench_native_concurrent_put<F, Fut>(transport: &'static str, connect: F) -> BenchResult
 where
     F: Fn() -> Fut + Clone + Send + Sync + 'static,
-    Fut: std::future::Future<Output = NativeClient> + Send + 'static,
+    Fut: std::future::Future<Output = RawNativeBenchClient> + Send + 'static,
 {
     let started = Instant::now();
     let deadline = started + MEASURE_DURATION;
@@ -1068,11 +1069,11 @@ where
 async fn bench_native_short_connection_get<F, Fut>(
     transport: &'static str,
     connect: F,
-    setup: &mut NativeClient,
+    setup: &mut RawNativeBenchClient,
 ) -> BenchResult
 where
     F: Fn() -> Fut + Clone + Send + Sync + 'static,
-    Fut: std::future::Future<Output = NativeClient> + Send + 'static,
+    Fut: std::future::Future<Output = RawNativeBenchClient> + Send + 'static,
 {
     assert_eq!(
         setup
@@ -1130,7 +1131,7 @@ async fn summarize_joined_samples(
     summarize(name, transport, notes, samples, started.elapsed(), 0)
 }
 
-async fn assert_native_batch_hits(client: &mut NativeClient, keys: &[Vec<u8>]) {
+async fn assert_native_batch_hits(client: &mut RawNativeBenchClient, keys: &[Vec<u8>]) {
     let response = client
         .request(
             Command::BatchGet,
@@ -1148,7 +1149,7 @@ async fn assert_native_batch_hits(client: &mut NativeClient, keys: &[Vec<u8>]) {
     );
 }
 
-async fn native_tag_invalidation_round(client: &mut NativeClient, index: usize) {
+async fn native_tag_invalidation_round(client: &mut RawNativeBenchClient, index: usize) {
     let tag = native_put_tagged_values(client, index).await;
     native_invalidate_tag(client, &tag, 8).await;
 }
@@ -1164,7 +1165,7 @@ fn engine_put_tagged_values(engine: &mut Engine, index: usize) -> String {
     tag
 }
 
-async fn native_put_tagged_values(client: &mut NativeClient, index: usize) -> String {
+async fn native_put_tagged_values(client: &mut RawNativeBenchClient, index: usize) -> String {
     let tag = format!("native-tag-{index}");
     for item in 0..8 {
         let key = format!("native-tag-{index}-{item}");
@@ -1185,7 +1186,11 @@ async fn native_put_tagged_values(client: &mut NativeClient, index: usize) -> St
     tag
 }
 
-async fn native_invalidate_tag(client: &mut NativeClient, tag: &str, expected_removed: u32) {
+async fn native_invalidate_tag(
+    client: &mut RawNativeBenchClient,
+    tag: &str,
+    expected_removed: u32,
+) {
     assert_eq!(
         client
             .request(Command::TagInvalidate, native_tag_invalidate_payload(tag))
@@ -1399,28 +1404,31 @@ fn native_unix_socket_path(name: &str) -> PathBuf {
     ))
 }
 
-struct NativeClient {
-    stream: NativeClientStream,
+// Benchmark-only raw protocol harness. This intentionally bypasses the official
+// Rust client so baseline rows can measure server/protocol overhead separately
+// from public client API overhead.
+struct RawNativeBenchClient {
+    stream: RawNativeBenchClientStream,
     transport: &'static str,
     next_request_id: u64,
     request_buffer: Vec<u8>,
     response_buffer: Vec<u8>,
 }
 
-enum NativeClientStream {
+enum RawNativeBenchClientStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
 }
 
-impl NativeClient {
+impl RawNativeBenchClient {
     async fn connect_tcp(addr: &str) -> Self {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match TcpStream::connect(addr).await {
                 Ok(stream) => {
                     return Self {
-                        stream: NativeClientStream::Tcp(stream),
+                        stream: RawNativeBenchClientStream::Tcp(stream),
                         transport: "loopback_tcp",
                         next_request_id: 1,
                         request_buffer: Vec::new(),
@@ -1442,7 +1450,7 @@ impl NativeClient {
             match UnixStream::connect(path).await {
                 Ok(stream) => {
                     return Self {
-                        stream: NativeClientStream::Unix(stream),
+                        stream: RawNativeBenchClientStream::Unix(stream),
                         transport: "loopback_unix",
                         next_request_id: 1,
                         request_buffer: Vec::new(),
@@ -1495,29 +1503,31 @@ impl NativeClient {
 
     async fn write_all_request_buffer(&mut self) {
         match &mut self.stream {
-            NativeClientStream::Tcp(stream) => stream.write_all(&self.request_buffer).await,
+            RawNativeBenchClientStream::Tcp(stream) => stream.write_all(&self.request_buffer).await,
             #[cfg(unix)]
-            NativeClientStream::Unix(stream) => stream.write_all(&self.request_buffer).await,
+            RawNativeBenchClientStream::Unix(stream) => {
+                stream.write_all(&self.request_buffer).await
+            }
         }
         .expect("native write");
     }
 
     async fn read_exact(&mut self, bytes: &mut [u8]) {
         match &mut self.stream {
-            NativeClientStream::Tcp(stream) => stream.read_exact(bytes).await,
+            RawNativeBenchClientStream::Tcp(stream) => stream.read_exact(bytes).await,
             #[cfg(unix)]
-            NativeClientStream::Unix(stream) => stream.read_exact(bytes).await,
+            RawNativeBenchClientStream::Unix(stream) => stream.read_exact(bytes).await,
         }
         .expect("native read");
     }
 
     async fn read_response_payload(&mut self, start: usize) {
         match &mut self.stream {
-            NativeClientStream::Tcp(stream) => {
+            RawNativeBenchClientStream::Tcp(stream) => {
                 stream.read_exact(&mut self.response_buffer[start..]).await
             }
             #[cfg(unix)]
-            NativeClientStream::Unix(stream) => {
+            RawNativeBenchClientStream::Unix(stream) => {
                 stream.read_exact(&mut self.response_buffer[start..]).await
             }
         }
