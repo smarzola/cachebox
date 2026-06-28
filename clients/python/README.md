@@ -12,6 +12,12 @@ Build and install the package in editable mode:
 uv run --with maturin maturin develop --manifest-path clients/python/Cargo.toml
 ```
 
+Check the Rust extension crate:
+
+```sh
+cargo check -p cachebox-python
+```
+
 Run the Python tests from the repository root with the local package built and
 installed into the same environment as pytest:
 
