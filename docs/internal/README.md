@@ -19,6 +19,7 @@ the top-level `docs/` files are the user-facing documentation.
 - [Performance uplift goal loop](performance-uplift-goal-loop.md)
 - [Performance uplift metrics](performance-uplift-metrics.md)
 - [Performance uplift pipelining](performance-uplift-pipelining.md)
+- [Performance uplift release summary](performance-uplift-release-summary.md)
 - [Performance uplift response copy](performance-uplift-response-copy.md)
 - [Performance uplift sharded engine](performance-uplift-sharded-engine.md)
 - [Performance uplift write path](performance-uplift-write-path.md)
