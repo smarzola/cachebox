@@ -43,6 +43,8 @@ scenario, measures for a fixed duration, and prints one row per scenario.
 - `tag_workflow_put8_invalidate`: full workflow that puts eight tagged values,
   then invalidates the tag.
 - `ttl_heavy_writes`: writes with TTL and stale TTL headers.
+- `pipelined_get_32`: one connection with 32 outstanding cached GET requests,
+  reported as per-request average latency for each pipeline round.
 - `concurrent_get_16`: 16 clients repeatedly read the same cached key.
 - `concurrent_put_16`: 16 clients write unique keys concurrently.
 - `short_connection_get`: connect, read one cached key, and close.
@@ -57,31 +59,33 @@ cargo run --bin cachebox-bench
 
 ```text
 scenario transport iterations p50_ns p95_ns p99_ns throughput_ops_s memory_used_bytes cost_score_total notes
-engine_get engine 2007089 417 541 875 2007088.00 113 0 engine_cached_hit
-engine_put engine 453296 1791 2209 2792 453295.96 52483526 0 engine_unique_keys
-engine_tag_invalidate_8 engine 41516 8125 8375 10833 121633.28 0 0 remove_8_tagged_keys
-single_key_get loopback_tcp 40954 23500 28750 51459 40953.97 0 0 cached_hit
-single_key_put loopback_tcp 38139 25708 28291 40458 38138.85 0 0 unique_keys
-batch_get_32 loopback_tcp 15098 65417 71833 86875 15097.80 0 0 32_keys
-lease_contention loopback_tcp 39569 25458 27792 40208 39568.56 0 0 same_missing_key
-tag_invalidate_empty loopback_tcp 42212 23125 27292 37750 42211.08 0 0 single_empty_invalidate
-tag_invalidate_8 loopback_tcp 3841 35375 38416 50250 28007.84 0 0 single_invalidate_8_tagged_keys
-tag_workflow_put8_invalidate loopback_tcp 3844 256541 278667 317708 3843.30 0 0 8_puts_plus_invalidate
-ttl_heavy_writes loopback_tcp 37116 26000 29875 41084 37115.13 0 0 ttl_and_stale_ttl
-concurrent_get_16 loopback_tcp 152504 100583 169167 205875 152457.11 0 0 16_clients_cached_hit
-concurrent_put_16 loopback_tcp 143758 102833 170042 204417 143719.17 0 0 16_clients_unique_keys
-short_connection_get loopback_tcp 13228 70583 77417 96834 13227.48 0 0 connect_get_close
-single_key_get loopback_unix 69021 13834 17375 28750 69020.04 0 0 cached_hit
-single_key_put loopback_unix 61547 15208 18583 28666 61546.94 0 0 unique_keys
-batch_get_32 loopback_unix 21234 44125 57958 66333 21233.44 0 0 32_keys
-lease_contention loopback_unix 68231 14000 17916 27916 68230.07 0 0 same_missing_key
-tag_invalidate_empty loopback_unix 71514 13125 17000 28584 71513.96 0 0 single_empty_invalidate
-tag_invalidate_8 loopback_unix 5687 26333 29209 40083 38266.66 0 0 single_invalidate_8_tagged_keys
-tag_workflow_put8_invalidate loopback_unix 5695 174125 192042 225917 5694.72 0 0 8_puts_plus_invalidate
-ttl_heavy_writes loopback_unix 54561 17167 20667 30542 54560.37 0 0 ttl_and_stale_ttl
-concurrent_get_16 loopback_unix 215770 71500 124250 154584 215713.85 0 0 16_clients_cached_hit
-concurrent_put_16 loopback_unix 190040 74292 128208 158916 189993.13 0 0 16_clients_unique_keys
-short_connection_get loopback_unix 28193 32125 38125 55792 28192.52 0 0 connect_get_close
+engine_get engine 2009407 417 541 792 2009406.83 113 0 engine_cached_hit
+engine_put engine 451685 1791 2250 2834 451684.92 52296650 0 engine_unique_keys
+engine_tag_invalidate_8 engine 41594 8125 8417 11167 121312.96 0 0 remove_8_tagged_keys
+single_key_get loopback_tcp 30929 31792 34959 53792 30928.16 0 0 cached_hit
+single_key_put loopback_tcp 30153 32542 35375 47958 30152.25 0 0 unique_keys
+batch_get_32 loopback_tcp 14533 67958 75750 90417 14532.35 0 0 32_keys
+lease_contention loopback_tcp 30716 32542 35250 47625 30715.50 0 0 same_missing_key
+tag_invalidate_empty loopback_tcp 31880 31042 33666 46167 31879.57 0 0 single_empty_invalidate
+tag_invalidate_8 loopback_tcp 3360 38792 42666 56458 25429.16 0 0 single_invalidate_8_tagged_keys
+tag_workflow_put8_invalidate loopback_tcp 3349 295917 320458 360500 3348.58 0 0 8_puts_plus_invalidate
+ttl_heavy_writes loopback_tcp 31144 31000 34958 46500 31143.15 0 0 ttl_and_stale_ttl
+pipelined_get_32 loopback_tcp 130496 7608 8888 9587 130467.87 0 0 one_connection_32_outstanding_gets
+concurrent_get_16 loopback_tcp 136721 111500 190500 240042 136678.37 0 0 16_clients_cached_hit
+concurrent_put_16 loopback_tcp 131688 111500 187083 231375 131654.25 0 0 16_clients_unique_keys
+short_connection_get loopback_tcp 12333 76416 84250 103875 12332.06 0 0 connect_get_close
+single_key_get loopback_unix 50846 19250 22042 32375 50845.18 0 0 cached_hit
+single_key_put loopback_unix 45349 21334 24625 35167 45348.65 0 0 unique_keys
+batch_get_32 loopback_unix 16475 62000 64833 73959 16474.04 0 0 32_keys
+lease_contention loopback_unix 48430 20750 23958 33042 48429.20 0 0 same_missing_key
+tag_invalidate_empty loopback_unix 52332 18542 21541 31708 52331.98 0 0 single_empty_invalidate
+tag_invalidate_8 loopback_unix 4388 29750 32583 44042 33612.19 0 0 single_invalidate_8_tagged_keys
+tag_workflow_put8_invalidate loopback_unix 4330 228375 247083 278375 4329.91 0 0 8_puts_plus_invalidate
+ttl_heavy_writes loopback_unix 40958 23875 26250 37917 40957.53 0 0 ttl_and_stale_ttl
+pipelined_get_32 loopback_unix 140832 7059 8399 9037 140814.01 0 0 one_connection_32_outstanding_gets
+concurrent_get_16 loopback_unix 188265 81625 142208 180750 188194.10 0 0 16_clients_cached_hit
+concurrent_put_16 loopback_unix 163171 83000 138459 168458 163119.87 0 0 16_clients_unique_keys
+short_connection_get loopback_unix 22356 40667 53750 69583 22355.95 0 0 connect_get_close
 ```
 
 The engine-only rows show the in-memory cache path is sub-microsecond for hot
@@ -90,6 +94,7 @@ single invalidation requests, and the full multi-request write plus invalidate
 workflow. Native TCP and Unix rows include socket transport, fixed header
 framing, protocol codec work, and body transfer. Native rows currently report
 `0` for memory and cost because the native data plane does not expose metrics.
-Concurrent rows aggregate samples across 16 client connections and expose
-multi-client server behavior. Short-connection rows include connection setup,
-one cached get, and connection close.
+Pipelined rows report per-request average latency from rounds where one
+connection has 32 outstanding requests. Concurrent rows aggregate samples across
+16 client connections and expose multi-client server behavior. Short-connection
+rows include connection setup, one cached get, and connection close.

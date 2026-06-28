@@ -18,6 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
@@ -32,6 +33,8 @@ use crate::protocol::{
     ResponsePayload, decode_borrowed_request_frame, decode_request_frame,
     encode_response_frame_into, encode_response_payload_view_frame_into,
 };
+
+const MAX_IN_FLIGHT_PER_CONNECTION: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct StartupReport {
@@ -332,72 +335,107 @@ async fn bind_native_unix_listener(path: &Path) -> std::io::Result<UnixListener>
 }
 
 async fn handle_native_connection<S>(
-    mut stream: S,
+    stream: S,
     state: AppState,
     max_payload_len: usize,
 ) -> std::io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut frame = Vec::new();
-    let mut response_buffer = Vec::new();
-    loop {
-        let mut header = [0; HEADER_LEN];
-        match stream.read_exact(&mut header).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error),
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (response_tx, mut response_rx) = mpsc::channel::<Vec<u8>>(MAX_IN_FLIGHT_PER_CONNECTION);
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONNECTION));
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(response) = response_rx.recv().await {
+            writer.write_all(&response).await?;
         }
+        std::io::Result::Ok(())
+    });
 
-        let payload_len =
-            u32::from_be_bytes(header[16..20].try_into().expect("slice length")) as usize;
-        if payload_len > max_payload_len {
-            return Ok(());
-        }
-
-        frame.clear();
-        frame.extend_from_slice(&header);
-        let start = frame.len();
-        frame.resize(HEADER_LEN + payload_len, 0);
-        stream.read_exact(&mut frame[start..]).await?;
-
-        let response = match decode_borrowed_request_frame(&frame, max_payload_len) {
-            Ok(Some(request)) => {
-                if let RequestPayloadView::Get { namespace, key } = request.payload {
-                    encode_native_get_response_frame(
-                        &state,
-                        request.request_id,
-                        request.command,
-                        namespace,
-                        key,
-                        &mut response_buffer,
-                    );
-                    stream.write_all(&response_buffer).await?;
-                    continue;
-                }
-                execute_native_request_view(&state, request)
-            }
-            Ok(None) => match decode_request_frame(&frame, max_payload_len) {
-                Ok(request) => execute_native_request(&state, request),
-                Err(error) => {
-                    if let Some(response) = native_decode_error_response(&frame, error) {
-                        encode_response_frame_into(&response, &mut response_buffer);
-                        stream.write_all(&response_buffer).await?;
-                    }
-                    return Ok(());
-                }
-            },
-            Err(error) => {
-                if let Some(response) = native_decode_error_response(&frame, error) {
-                    encode_response_frame_into(&response, &mut response_buffer);
-                    stream.write_all(&response_buffer).await?;
-                }
-                return Ok(());
-            }
-        };
-        encode_response_frame_into(&response, &mut response_buffer);
-        stream.write_all(&response_buffer).await?;
+    while let Some(frame) = read_native_frame(&mut reader, max_payload_len).await? {
+        let permit = Arc::clone(&in_flight)
+            .acquire_owned()
+            .await
+            .expect("connection semaphore should stay open");
+        let state = state.clone();
+        let response_tx = response_tx.clone();
+        tokio::spawn(async move {
+            let response = execute_native_frame_bytes(&state, &frame, max_payload_len);
+            let _ = response_tx.send(response).await;
+            drop(permit);
+        });
     }
+
+    drop(response_tx);
+    writer_task
+        .await
+        .map_err(|error| io::Error::other(format!("native writer task failed: {error}")))?
+}
+
+async fn read_native_frame<R>(
+    reader: &mut R,
+    max_payload_len: usize,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0; HEADER_LEN];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    let payload_len = u32::from_be_bytes(header[16..20].try_into().expect("slice length")) as usize;
+    if payload_len > max_payload_len {
+        return Ok(None);
+    }
+
+    let mut frame = Vec::with_capacity(HEADER_LEN + payload_len);
+    frame.extend_from_slice(&header);
+    let start = frame.len();
+    frame.resize(HEADER_LEN + payload_len, 0);
+    reader.read_exact(&mut frame[start..]).await?;
+    Ok(Some(frame))
+}
+
+fn execute_native_frame_bytes(state: &AppState, frame: &[u8], max_payload_len: usize) -> Vec<u8> {
+    let mut response_buffer = Vec::new();
+    match decode_borrowed_request_frame(frame, max_payload_len) {
+        Ok(Some(request)) => {
+            if let RequestPayloadView::Get { namespace, key } = request.payload {
+                encode_native_get_response_frame(
+                    state,
+                    request.request_id,
+                    request.command,
+                    namespace,
+                    key,
+                    &mut response_buffer,
+                );
+            } else {
+                let response = execute_native_request_view(state, request);
+                encode_response_frame_into(&response, &mut response_buffer);
+            }
+        }
+        Ok(None) => match decode_request_frame(frame, max_payload_len) {
+            Ok(request) => {
+                let response = execute_native_request(state, request);
+                encode_response_frame_into(&response, &mut response_buffer);
+            }
+            Err(error) => {
+                if let Some(response) = native_decode_error_response(frame, error) {
+                    encode_response_frame_into(&response, &mut response_buffer);
+                }
+            }
+        },
+        Err(error) => {
+            if let Some(response) = native_decode_error_response(frame, error) {
+                encode_response_frame_into(&response, &mut response_buffer);
+            }
+        }
+    }
+    response_buffer
 }
 
 async fn handle_request(
@@ -909,10 +947,24 @@ mod tests {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        write_native_request(stream, request).await;
+        read_native_response(stream).await
+    }
+
+    async fn write_native_request<S>(stream: &mut S, request: NativeRequestFrame)
+    where
+        S: AsyncWrite + Unpin,
+    {
         stream
             .write_all(&encode_request_frame(&request))
             .await
             .expect("native request write");
+    }
+
+    async fn read_native_response<S>(stream: &mut S) -> NativeResponseFrame
+    where
+        S: AsyncRead + Unpin,
+    {
         let mut header = [0; HEADER_LEN];
         stream
             .read_exact(&mut header)
@@ -1120,6 +1172,73 @@ mod tests {
         )
         .await;
         assert_eq!(miss.payload, ResponsePayload::Miss);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn native_tcp_supports_pipelined_requests_on_one_connection() {
+        let (mut stream, task) = native_test_client().await;
+
+        let requests = [
+            NativeRequestFrame {
+                request_id: 101,
+                command: Command::Put,
+                payload: RequestPayload::Put {
+                    namespace: "default".to_string(),
+                    key: b"pipelined".to_vec(),
+                    metadata: Metadata::default(),
+                    value: b"value".to_vec(),
+                },
+            },
+            NativeRequestFrame {
+                request_id: 102,
+                command: Command::Get,
+                payload: RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"pipelined".to_vec(),
+                },
+            },
+            NativeRequestFrame {
+                request_id: 103,
+                command: Command::Get,
+                payload: RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"missing".to_vec(),
+                },
+            },
+        ];
+
+        for request in requests {
+            write_native_request(&mut stream, request).await;
+        }
+
+        let mut responses = Vec::new();
+        for _ in 0..3 {
+            responses.push(read_native_response(&mut stream).await);
+        }
+
+        let response = |request_id| {
+            responses
+                .iter()
+                .find(|response| response.request_id == request_id)
+                .expect("response id")
+        };
+        assert_eq!(
+            response(101).payload,
+            ResponsePayload::Stored { evicted: 0 }
+        );
+        assert_eq!(response(101).command, Command::Put);
+        assert!(
+            matches!(
+                response(102).payload,
+                ResponsePayload::Hit(_) | ResponsePayload::Miss
+            ),
+            "pipelined get can race with pipelined put and must be matched by request id"
+        );
+        assert_eq!(response(102).command, Command::Get);
+        assert_eq!(response(103).payload, ResponsePayload::Miss);
+        assert_eq!(response(103).command, Command::Get);
 
         task.abort();
     }

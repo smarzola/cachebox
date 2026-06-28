@@ -21,6 +21,7 @@ use tokio::runtime::Runtime;
 const WARMUP_ITERS: usize = 100;
 const MEASURE_DURATION: Duration = Duration::from_secs(1);
 const CONCURRENT_CLIENTS: usize = 16;
+const PIPELINE_DEPTH: usize = 32;
 
 macro_rules! warmup_async {
     ($body:block) => {
@@ -71,6 +72,7 @@ async fn async_main() {
         bench_native_tag_invalidate_8(&mut native_client).await,
         bench_native_tag_invalidation(&mut native_client).await,
         bench_native_ttl_heavy_writes(&mut native_client).await,
+        bench_native_pipelined_get(&mut native_client).await,
         bench_native_concurrent_get_tcp(&native_server.addr).await,
         bench_native_concurrent_put_tcp(&native_server.addr).await,
         bench_native_short_connection_get_tcp(&native_server.addr).await,
@@ -89,6 +91,7 @@ async fn async_main() {
             bench_native_tag_invalidate_8(&mut native_unix_client).await,
             bench_native_tag_invalidation(&mut native_unix_client).await,
             bench_native_ttl_heavy_writes(&mut native_unix_client).await,
+            bench_native_pipelined_get(&mut native_unix_client).await,
             bench_native_concurrent_get_unix(&native_unix_server.path).await,
             bench_native_concurrent_put_unix(&native_unix_server.path).await,
             bench_native_short_connection_get_unix(&native_unix_server.path).await,
@@ -413,6 +416,62 @@ async fn bench_native_ttl_heavy_writes(client: &mut NativeClient) -> BenchResult
             ResponsePayload::Stored { evicted: 0 }
         );
     })
+}
+
+async fn bench_native_pipelined_get(client: &mut NativeClient) -> BenchResult {
+    assert_eq!(
+        client
+            .request(
+                Command::Put,
+                native_put_payload(b"pipeline-get-key", Metadata::default(), b"value")
+            )
+            .await,
+        ResponsePayload::Stored { evicted: 0 }
+    );
+    warmup_async!({
+        native_pipelined_get_round(client).await;
+    });
+
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let sample_started = Instant::now();
+        native_pipelined_get_round(client).await;
+        let per_request = sample_started.elapsed() / PIPELINE_DEPTH as u32;
+        samples.extend(std::iter::repeat_n(per_request, PIPELINE_DEPTH));
+    }
+    summarize(
+        "pipelined_get_32",
+        client.transport,
+        "one_connection_32_outstanding_gets",
+        samples,
+        started.elapsed(),
+        0,
+    )
+}
+
+async fn native_pipelined_get_round(client: &mut NativeClient) {
+    let mut expected_ids = Vec::with_capacity(PIPELINE_DEPTH);
+    for _ in 0..PIPELINE_DEPTH {
+        let request_id = client
+            .send_request(Command::Get, native_get_payload(b"pipeline-get-key"))
+            .await;
+        expected_ids.push(request_id);
+    }
+
+    let mut seen = vec![false; PIPELINE_DEPTH];
+    for _ in 0..PIPELINE_DEPTH {
+        let response = client.read_response().await;
+        let index = expected_ids
+            .iter()
+            .position(|request_id| *request_id == response.request_id)
+            .expect("pipelined response id should match a request");
+        assert!(!seen[index], "duplicate pipelined response id");
+        seen[index] = true;
+        assert_eq!(response.command, Command::Get);
+        assert_eq!(response.payload, ResponsePayload::Hit(b"value".to_vec()));
+    }
+    assert!(seen.into_iter().all(|seen| seen));
 }
 
 async fn bench_native_concurrent_get_tcp(addr: &str) -> BenchResult {
@@ -962,6 +1021,14 @@ impl NativeClient {
     }
 
     async fn request(&mut self, command: Command, payload: RequestPayload) -> ResponsePayload {
+        let request_id = self.send_request(command, payload).await;
+        let response = self.read_response().await;
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.command, command);
+        response.payload
+    }
+
+    async fn send_request(&mut self, command: Command, payload: RequestPayload) -> u64 {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let frame = RequestFrame {
@@ -971,7 +1038,10 @@ impl NativeClient {
         };
         encode_request_frame_into(&frame, &mut self.request_buffer);
         self.write_all_request_buffer().await;
+        request_id
+    }
 
+    async fn read_response(&mut self) -> cachebox::protocol::ResponseFrame {
         let mut header = [0u8; HEADER_LEN];
         self.read_exact(&mut header).await;
         let payload_len =
@@ -982,11 +1052,8 @@ impl NativeClient {
         self.response_buffer.resize(HEADER_LEN + payload_len, 0);
         self.read_response_payload(start).await;
 
-        let response = decode_response_frame(&self.response_buffer, usize::MAX)
-            .expect("native response should decode");
-        assert_eq!(response.request_id, request_id);
-        assert_eq!(response.command, command);
-        response.payload
+        decode_response_frame(&self.response_buffer, usize::MAX)
+            .expect("native response should decode")
     }
 
     async fn write_all_request_buffer(&mut self) {

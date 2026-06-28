@@ -22,8 +22,9 @@ preserving current cache semantics.
 - Clients may send multiple requests without waiting for earlier responses.
 - Every request includes a `request_id`.
 - Every response echoes the matching `request_id`.
-- Servers may respond out of order after native execution is sharded. The first
-  implementation may respond in order, but clients must match by `request_id`.
+- Servers process requests concurrently up to an implementation-defined
+  per-connection in-flight limit and may respond out of order. Clients must
+  match responses by `request_id`.
 - A protocol error response is preferred when the frame header is valid and the
   request id is readable.
 - If the header is invalid, truncated, oversized, or impossible to resynchronize
