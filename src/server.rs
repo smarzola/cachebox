@@ -28,7 +28,8 @@ use crate::engine::{
 };
 use crate::protocol::{
     BatchItem, Command, DecodeError, ErrorCode, HEADER_LEN, Metadata as NativeMetadata,
-    RequestFrame, RequestPayload, ResponseFrame, ResponsePayload, decode_request_frame,
+    RequestFrame, RequestFrameView, RequestPayload, RequestPayloadView, ResponseFrame,
+    ResponsePayload, decode_borrowed_request_frame, decode_request_frame,
     encode_response_frame_into,
 };
 
@@ -360,8 +361,18 @@ where
         frame.resize(HEADER_LEN + payload_len, 0);
         stream.read_exact(&mut frame[start..]).await?;
 
-        let request = match decode_request_frame(&frame, max_payload_len) {
-            Ok(request) => request,
+        let response = match decode_borrowed_request_frame(&frame, max_payload_len) {
+            Ok(Some(request)) => execute_native_request_view(&state, request),
+            Ok(None) => match decode_request_frame(&frame, max_payload_len) {
+                Ok(request) => execute_native_request(&state, request),
+                Err(error) => {
+                    if let Some(response) = native_decode_error_response(&frame, error) {
+                        encode_response_frame_into(&response, &mut response_buffer);
+                        stream.write_all(&response_buffer).await?;
+                    }
+                    return Ok(());
+                }
+            },
             Err(error) => {
                 if let Some(response) = native_decode_error_response(&frame, error) {
                     encode_response_frame_into(&response, &mut response_buffer);
@@ -370,7 +381,6 @@ where
                 return Ok(());
             }
         };
-        let response = execute_native_request(&state, request);
         encode_response_frame_into(&response, &mut response_buffer);
         stream.write_all(&response_buffer).await?;
     }
@@ -412,30 +422,58 @@ fn execute_native_request(state: &AppState, frame: RequestFrame) -> ResponseFram
     }
 }
 
-fn execute_native_payload(state: &AppState, payload: RequestPayload) -> ResponsePayload {
+fn execute_native_request_view(state: &AppState, frame: RequestFrameView<'_>) -> ResponseFrame {
+    ResponseFrame {
+        request_id: frame.request_id,
+        command: frame.command,
+        payload: execute_native_payload_view(state, frame.payload),
+    }
+}
+
+fn execute_native_payload_view(
+    state: &AppState,
+    payload: RequestPayloadView<'_>,
+) -> ResponsePayload {
     match payload {
-        RequestPayload::Get { namespace, key } => {
-            state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
-            match state
+        RequestPayloadView::Get { namespace, key } => execute_native_get(state, namespace, key),
+        RequestPayloadView::Delete { namespace, key } => {
+            state
+                .metrics
+                .delete_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let removed = state
                 .engine
                 .lock()
                 .expect("engine mutex poisoned")
-                .get(&namespace, &key)
-            {
-                GetOutcome::Hit(value) => {
-                    state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
-                    ResponsePayload::Hit(value)
-                }
-                GetOutcome::Stale(value) => {
-                    state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
-                    ResponsePayload::Stale(value)
-                }
-                GetOutcome::Miss => {
-                    state.metrics.misses_total.fetch_add(1, Ordering::Relaxed);
-                    ResponsePayload::Miss
-                }
+                .delete(namespace, key);
+            ResponsePayload::Deleted { removed }
+        }
+        RequestPayloadView::TagInvalidate { namespace, tag } => {
+            state
+                .metrics
+                .tag_invalidate_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let removed = state
+                .engine
+                .lock()
+                .expect("engine mutex poisoned")
+                .invalidate_tag(namespace, tag);
+            ResponsePayload::Invalidated {
+                removed: removed.min(u32::MAX as usize) as u32,
             }
         }
+        RequestPayloadView::LeaseStart {
+            namespace,
+            key,
+            lease_ttl_ms,
+            allow_stale_ms: _,
+        } => execute_native_lease_start(state, namespace, key, lease_ttl_ms),
+    }
+}
+
+fn execute_native_payload(state: &AppState, payload: RequestPayload) -> ResponsePayload {
+    match payload {
+        RequestPayload::Get { namespace, key } => execute_native_get(state, &namespace, &key),
         RequestPayload::Put {
             namespace,
             key,
@@ -518,34 +556,7 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
             key,
             lease_ttl_ms,
             allow_stale_ms: _,
-        } => {
-            match state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .start_lease(&namespace, &key, lease_ttl_ms)
-            {
-                StartLeaseOutcome::Hit(value) => {
-                    state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
-                    ResponsePayload::Hit(value)
-                }
-                StartLeaseOutcome::Stale { value } => {
-                    state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
-                    ResponsePayload::Stale(value)
-                }
-                StartLeaseOutcome::LeaseGranted { token, stale_value } => {
-                    state.metrics.lease_grants.fetch_add(1, Ordering::Relaxed);
-                    ResponsePayload::LeaseGranted {
-                        lease_token: token,
-                        stale_value,
-                    }
-                }
-                StartLeaseOutcome::LeaseDenied => {
-                    state.metrics.lease_denials.fetch_add(1, Ordering::Relaxed);
-                    ResponsePayload::LeaseDenied
-                }
-            }
-        }
+        } => execute_native_lease_start(state, &namespace, &key, lease_ttl_ms),
         RequestPayload::LeaseComplete {
             namespace,
             key,
@@ -584,6 +595,63 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
                     native_put_error(error)
                 }
             }
+        }
+    }
+}
+
+fn execute_native_get(state: &AppState, namespace: &str, key: &[u8]) -> ResponsePayload {
+    state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
+    match state
+        .engine
+        .lock()
+        .expect("engine mutex poisoned")
+        .get(namespace, key)
+    {
+        GetOutcome::Hit(value) => {
+            state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+            ResponsePayload::Hit(value)
+        }
+        GetOutcome::Stale(value) => {
+            state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+            ResponsePayload::Stale(value)
+        }
+        GetOutcome::Miss => {
+            state.metrics.misses_total.fetch_add(1, Ordering::Relaxed);
+            ResponsePayload::Miss
+        }
+    }
+}
+
+fn execute_native_lease_start(
+    state: &AppState,
+    namespace: &str,
+    key: &[u8],
+    lease_ttl_ms: u64,
+) -> ResponsePayload {
+    match state
+        .engine
+        .lock()
+        .expect("engine mutex poisoned")
+        .start_lease(namespace, key, lease_ttl_ms)
+    {
+        StartLeaseOutcome::Hit(value) => {
+            state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+            ResponsePayload::Hit(value)
+        }
+        StartLeaseOutcome::Stale { value } => {
+            state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+            ResponsePayload::Stale(value)
+        }
+        StartLeaseOutcome::LeaseGranted { token, stale_value } => {
+            state.metrics.lease_grants.fetch_add(1, Ordering::Relaxed);
+            ResponsePayload::LeaseGranted {
+                lease_token: token,
+                stale_value,
+            }
+        }
+        StartLeaseOutcome::LeaseDenied => {
+            state.metrics.lease_denials.fetch_add(1, Ordering::Relaxed);
+            ResponsePayload::LeaseDenied
         }
     }
 }

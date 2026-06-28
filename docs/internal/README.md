@@ -15,6 +15,7 @@ the top-level `docs/` files are the user-facing documentation.
 - [Native socket transport audit](native-socket-transport-audit.md)
 - [Native socket transport goal loop](native-socket-goal-loop.md)
 - [Performance uplift baseline](performance-uplift-baseline.md)
+- [Performance uplift borrowed decode](performance-uplift-borrowed-decode.md)
 - [Performance uplift goal loop](performance-uplift-goal-loop.md)
 - [Redis adapter notes](redis-adapter.md)
 - [Supported behavior snapshot](supported-behavior.md)

@@ -58,6 +58,13 @@ pub struct RequestFrame {
     pub payload: RequestPayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestFrameView<'a> {
+    pub request_id: u64,
+    pub command: Command,
+    pub payload: RequestPayloadView<'a>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestPayload {
     Get {
@@ -94,6 +101,28 @@ pub enum RequestPayload {
         lease_token: String,
         metadata: Metadata,
         value: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestPayloadView<'a> {
+    Get {
+        namespace: &'a str,
+        key: &'a [u8],
+    },
+    Delete {
+        namespace: &'a str,
+        key: &'a [u8],
+    },
+    TagInvalidate {
+        namespace: &'a str,
+        tag: &'a str,
+    },
+    LeaseStart {
+        namespace: &'a str,
+        key: &'a [u8],
+        lease_ttl_ms: u64,
+        allow_stale_ms: Option<u64>,
     },
 }
 
@@ -253,6 +282,69 @@ pub fn decode_request_frame(
         command,
         payload,
     })
+}
+
+pub fn decode_borrowed_request_frame(
+    input: &[u8],
+    max_payload_len: usize,
+) -> Result<Option<RequestFrameView<'_>>, DecodeError> {
+    let header = decode_header(input, max_payload_len, KIND_REQUEST)?;
+    let payload_start = HEADER_LEN;
+    let payload_end = payload_start + header.payload_len;
+    if input.len() < payload_end {
+        return Err(DecodeError::TruncatedPayload {
+            expected: payload_end,
+            actual: input.len(),
+        });
+    }
+
+    let command = Command::from_id(header.command)?;
+    let mut cursor = Cursor::new(&input[payload_start..payload_end]);
+    let payload = match command {
+        Command::Get => Some(RequestPayloadView::Get {
+            namespace: read_borrowed_namespace(&mut cursor)?,
+            key: cursor.read_borrowed_bytes()?,
+        }),
+        Command::Delete => Some(RequestPayloadView::Delete {
+            namespace: read_borrowed_namespace(&mut cursor)?,
+            key: cursor.read_borrowed_bytes()?,
+        }),
+        Command::TagInvalidate => Some(RequestPayloadView::TagInvalidate {
+            namespace: read_borrowed_namespace(&mut cursor)?,
+            tag: read_borrowed_tag(&mut cursor)?,
+        }),
+        Command::LeaseStart => {
+            let namespace = read_borrowed_namespace(&mut cursor)?;
+            let key = cursor.read_borrowed_bytes()?;
+            let lease_ttl_ms = cursor.read_u64()?;
+            if lease_ttl_ms == 0 {
+                return Err(DecodeError::InvalidPayload(
+                    "lease ttl must be greater than zero",
+                ));
+            }
+            let allow_stale_ms = match cursor.read_u64()? {
+                0 => None,
+                value => Some(value),
+            };
+            Some(RequestPayloadView::LeaseStart {
+                namespace,
+                key,
+                lease_ttl_ms,
+                allow_stale_ms,
+            })
+        }
+        Command::Put | Command::BatchGet | Command::LeaseComplete => None,
+    };
+    if let Some(payload) = payload {
+        cursor.expect_empty()?;
+        Ok(Some(RequestFrameView {
+            request_id: header.request_id,
+            command,
+            payload,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn encode_request_frame(frame: &RequestFrame) -> Vec<u8> {
@@ -686,11 +778,7 @@ fn write_metadata(out: &mut Vec<u8>, metadata: &Metadata) {
 
 fn read_namespace(cursor: &mut Cursor<'_>) -> Result<String, DecodeError> {
     let namespace = cursor.read_string()?;
-    if namespace.is_empty()
-        || !namespace
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
+    if !is_valid_namespace(&namespace) {
         return Err(DecodeError::InvalidNamespace);
     }
     Ok(namespace)
@@ -698,14 +786,40 @@ fn read_namespace(cursor: &mut Cursor<'_>) -> Result<String, DecodeError> {
 
 fn read_tag(cursor: &mut Cursor<'_>) -> Result<String, DecodeError> {
     let tag = cursor.read_string()?;
-    if tag.is_empty()
-        || !tag.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.' | b'/')
-        })
-    {
+    if !is_valid_tag(&tag) {
         return Err(DecodeError::InvalidTag);
     }
     Ok(tag)
+}
+
+fn read_borrowed_namespace<'a>(cursor: &mut Cursor<'a>) -> Result<&'a str, DecodeError> {
+    let namespace = cursor.read_borrowed_string()?;
+    if !is_valid_namespace(namespace) {
+        return Err(DecodeError::InvalidNamespace);
+    }
+    Ok(namespace)
+}
+
+fn read_borrowed_tag<'a>(cursor: &mut Cursor<'a>) -> Result<&'a str, DecodeError> {
+    let tag = cursor.read_borrowed_string()?;
+    if !is_valid_tag(tag) {
+        return Err(DecodeError::InvalidTag);
+    }
+    Ok(tag)
+}
+
+fn is_valid_namespace(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn is_valid_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.' | b'/')
+        })
 }
 
 struct Cursor<'a> {
@@ -757,6 +871,15 @@ impl<'a> Cursor<'a> {
 
     fn read_string(&mut self) -> Result<String, DecodeError> {
         String::from_utf8(self.read_bytes()?).map_err(|_| DecodeError::InvalidUtf8)
+    }
+
+    fn read_borrowed_bytes(&mut self) -> Result<&'a [u8], DecodeError> {
+        let len = self.read_u32()? as usize;
+        self.read_exact(len)
+    }
+
+    fn read_borrowed_string(&mut self) -> Result<&'a str, DecodeError> {
+        std::str::from_utf8(self.read_borrowed_bytes()?).map_err(|_| DecodeError::InvalidUtf8)
     }
 
     fn read_exact(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
@@ -860,6 +983,86 @@ mod tests {
                 namespace: "default".to_string(),
                 key: b"user:1".to_vec()
             }
+        );
+    }
+
+    #[test]
+    fn decodes_hot_request_views_without_owning_payload_fields() {
+        let frame = encode_request_frame(&RequestFrame {
+            request_id: 7,
+            command: Command::Get,
+            payload: RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"user:1".to_vec(),
+            },
+        });
+        let view = decode_borrowed_request_frame(&frame, MAX_PAYLOAD)
+            .expect("borrowed decode")
+            .expect("hot request view");
+
+        assert_eq!(view.request_id, 7);
+        assert_eq!(view.command, Command::Get);
+        let RequestPayloadView::Get { namespace, key } = view.payload else {
+            panic!("expected get view");
+        };
+        assert_eq!(namespace, "default");
+        assert_eq!(key, b"user:1");
+
+        let frame_start = frame.as_ptr() as usize;
+        let frame_end = frame_start + frame.len();
+        let namespace_ptr = namespace.as_ptr() as usize;
+        let key_ptr = key.as_ptr() as usize;
+        assert!((frame_start..frame_end).contains(&namespace_ptr));
+        assert!((frame_start..frame_end).contains(&key_ptr));
+    }
+
+    #[test]
+    fn borrowed_decode_skips_owned_only_request_shapes() {
+        let frame = encode_request_frame(&RequestFrame {
+            request_id: 8,
+            command: Command::Put,
+            payload: RequestPayload::Put {
+                namespace: "default".to_string(),
+                key: b"k".to_vec(),
+                metadata: Metadata::default(),
+                value: b"value".to_vec(),
+            },
+        });
+
+        assert_eq!(
+            decode_borrowed_request_frame(&frame, MAX_PAYLOAD).expect("borrowed decode"),
+            None
+        );
+    }
+
+    #[test]
+    fn borrowed_decode_validates_hot_request_fields() {
+        let invalid_namespace = encode_request_frame(&RequestFrame {
+            request_id: 9,
+            command: Command::Get,
+            payload: RequestPayload::Get {
+                namespace: "bad namespace".to_string(),
+                key: b"k".to_vec(),
+            },
+        });
+
+        assert_eq!(
+            decode_borrowed_request_frame(&invalid_namespace, MAX_PAYLOAD),
+            Err(DecodeError::InvalidNamespace)
+        );
+
+        let invalid_tag = encode_request_frame(&RequestFrame {
+            request_id: 10,
+            command: Command::TagInvalidate,
+            payload: RequestPayload::TagInvalidate {
+                namespace: "default".to_string(),
+                tag: "bad tag".to_string(),
+            },
+        });
+
+        assert_eq!(
+            decode_borrowed_request_frame(&invalid_tag, MAX_PAYLOAD),
+            Err(DecodeError::InvalidTag)
         );
     }
 
