@@ -4,8 +4,6 @@
 //! cache requests and native responses into byte buffers. TCP and Unix socket
 //! listeners are intentionally outside this module.
 
-use crate::api::{ContentType, Ttl};
-
 pub const MAGIC: [u8; 4] = *b"CBX1";
 pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 24;
@@ -145,6 +143,17 @@ impl Default for Metadata {
             content_type: ContentType::OctetStream,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentType {
+    OctetStream,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ttl {
+    pub milliseconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1161,6 +1170,49 @@ mod tests {
         assert_eq!(encoded[24], 0x01);
         assert_eq!(u32::from_be_bytes(encoded[25..29].try_into().unwrap()), 5);
         assert_eq!(&encoded[29..34], b"bytes");
+    }
+
+    #[test]
+    fn get_request_matches_golden_bytes() {
+        let frame = RequestFrame {
+            request_id: 0x0102_0304_0506_0708,
+            command: Command::Get,
+            payload: RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"k".to_vec(),
+            },
+        };
+        let golden = [
+            b'C', b'B', b'X', b'1', 0x01, 0x00, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+            b'd', b'e', b'f', b'a', b'u', b'l', b't', 0x00, 0x00, 0x00, 0x01, b'k',
+        ];
+
+        assert_eq!(encode_request_frame(&frame), golden);
+        assert_eq!(
+            decode_request_frame(&golden, MAX_PAYLOAD).expect("golden request"),
+            frame
+        );
+    }
+
+    #[test]
+    fn hit_response_matches_golden_bytes() {
+        let frame = ResponseFrame {
+            request_id: 0x0102_0304_0506_0708,
+            command: Command::Get,
+            payload: ResponsePayload::Hit(b"bytes".to_vec()),
+        };
+        let golden = [
+            b'C', b'B', b'X', b'1', 0x01, 0x01, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x05, b'b', b'y', b't', b'e', b's',
+        ];
+
+        assert_eq!(encode_response_frame(&frame), golden);
+        assert_eq!(
+            decode_response_frame(&golden, MAX_PAYLOAD).expect("golden response"),
+            frame
+        );
     }
 
     #[test]

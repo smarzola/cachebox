@@ -5,6 +5,10 @@ current server, protocol, Rust client, AI helper, benchmark, test, and
 documentation boundaries before moving code into separate official client
 packages.
 
+Status note: this document intentionally describes the pre-extraction boundary
+state. Milestone 2 begins moving protocol code into `crates/cachebox-protocol`;
+use the current source tree as authoritative for post-extraction paths.
+
 ## Target Behavior
 
 Cachebox should keep the server binary focused on cache execution and native

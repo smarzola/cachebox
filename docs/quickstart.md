@@ -33,9 +33,8 @@ This example stores `cached bytes` under a byte key. It gives the entry a fresh
 TTL, a stale window, two tags, and an optional cost score.
 
 ```rust
-use cachebox::api::Ttl;
 use cachebox::client::NativeClient;
-use cachebox::protocol::{Metadata, ResponsePayload};
+use cachebox::protocol::{Metadata, ResponsePayload, Ttl};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

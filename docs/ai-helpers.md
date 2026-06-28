@@ -164,8 +164,7 @@ chunk append protocol.
 Use native metadata to record a recomputation score:
 
 ```rust
-use cachebox::api::Ttl;
-use cachebox::protocol::Metadata;
+use cachebox::protocol::{Metadata, Ttl};
 
 let metadata = Metadata {
     cost: Some(1800),

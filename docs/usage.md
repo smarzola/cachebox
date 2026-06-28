@@ -11,9 +11,8 @@ get from each feature.
 All Rust examples use:
 
 ```rust
-use cachebox::api::Ttl;
 use cachebox::client::NativeClient;
-use cachebox::protocol::{BatchItem, Command, Metadata, RequestPayload, ResponsePayload};
+use cachebox::protocol::{BatchItem, Command, Metadata, RequestPayload, ResponsePayload, Ttl};
 ```
 
 Connect over TCP:

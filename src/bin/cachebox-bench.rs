@@ -4,14 +4,13 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cachebox::api::Ttl;
 use cachebox::client::NativeClient as OfficialNativeClient;
 use cachebox::config::Config;
 use cachebox::engine::{Engine, GetOutcome, GetOutcomeRef, PutCommand, ShardedEngine};
 use cachebox::protocol::{
     BatchItem, Command, HEADER_LEN, Metadata, RequestFrame, RequestPayload, ResponsePayload,
-    ResponsePayloadView, decode_request_frame, decode_response_frame, encode_request_frame_into,
-    encode_response_payload_view_frame_into,
+    ResponsePayloadView, Ttl, decode_request_frame, decode_response_frame,
+    encode_request_frame_into, encode_response_payload_view_frame_into,
 };
 use cachebox::server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

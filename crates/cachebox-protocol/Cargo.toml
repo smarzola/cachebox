@@ -1,0 +1,9 @@
+[package]
+name = "cachebox-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Native protocol types and codec for Cachebox."
+license = "MIT"
+repository = "https://github.com/smarzola/cachebox"
+
+[dependencies]
