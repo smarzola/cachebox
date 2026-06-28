@@ -5,8 +5,8 @@ a native Python implementation so it can support normal Python sockets,
 `asyncio`, gevent-compatible usage, pure Python wheels, and source
 distributions without requiring a Rust toolchain.
 
-The current package includes a pure Python native protocol codec. Sync and
-async clients, connection pools, decorators, serializers, and dogpile
+The current package includes a pure Python native protocol codec and
+synchronous socket client. Async clients, decorators, serializers, and dogpile
 protection are implemented in follow-up native Python milestones.
 
 ## Local Development
@@ -27,15 +27,11 @@ uv build clients/python
 ## Example
 
 ```python
-from cachebox import protocol
+from cachebox import Client, protocol
 
-frame = protocol.RequestFrame(
-    request_id=1,
-    command=protocol.Command.GET,
-    payload=protocol.Get("default", b"user:123"),
-)
+with Client.connect_tcp("127.0.0.1:7401") as client:
+    client.put("default", b"user:123", b"cached bytes")
 
-encoded = protocol.encode_request_frame(frame)
-decoded = protocol.decode_request_frame(encoded)
-assert decoded == frame
+    result = client.get("default", b"user:123")
+    assert result == protocol.Hit(b"cached bytes")
 ```
