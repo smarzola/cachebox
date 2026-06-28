@@ -8,10 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cachebox::protocol::{
-    BatchItem, Command as NativeCommand, ContentType, Metadata, RequestPayload, ResponsePayload,
-    Ttl,
+    Command as NativeCommand, ContentType, Metadata, RequestPayload, ResponsePayload, Ttl,
 };
-use cachebox_client::{ClientError, NativeClient};
+use cachebox_client::{ClientError, GetResult, LeaseStartResult, NativeClient};
 
 struct ServerProcess {
     child: Child,
@@ -83,7 +82,7 @@ async fn native_client_workflow(mut client: NativeClient) {
             .get("default", b"blob".to_vec())
             .await
             .expect("native get"),
-        ResponsePayload::Hit(value)
+        GetResult::Hit(value)
     );
 
     assert_eq!(
@@ -92,8 +91,8 @@ async fn native_client_workflow(mut client: NativeClient) {
             .await
             .expect("native batch"),
         vec![
-            BatchItem::Hit(vec![0, 255, b'v', b'a', b'l']),
-            BatchItem::Miss
+            GetResult::Hit(vec![0, 255, b'v', b'a', b'l']),
+            GetResult::Miss
         ]
     );
 
@@ -128,7 +127,7 @@ async fn native_client_workflow(mut client: NativeClient) {
         .await
         .expect("native lease start");
     let token = match lease {
-        ResponsePayload::LeaseGranted { lease_token, .. } => lease_token,
+        LeaseStartResult::LeaseGranted { lease_token, .. } => lease_token,
         other => panic!("expected lease grant, got {other:?}"),
     };
     assert_eq!(
@@ -149,7 +148,7 @@ async fn native_client_workflow(mut client: NativeClient) {
             .get("default", b"leased".to_vec())
             .await
             .expect("native leased get"),
-        ResponsePayload::Hit(b"leased-value".to_vec())
+        GetResult::Hit(b"leased-value".to_vec())
     );
 
     assert_eq!(
@@ -164,7 +163,7 @@ async fn native_client_workflow(mut client: NativeClient) {
             .get("default", b"blob".to_vec())
             .await
             .expect("native miss"),
-        ResponsePayload::Miss
+        GetResult::Miss
     );
 
     assert!(
@@ -243,8 +242,8 @@ fn spawned_binary_grants_one_lease_under_client_contention() {
                     .await
                     .expect("native lease start")
                 {
-                    ResponsePayload::LeaseGranted { .. } => "lease_granted".to_string(),
-                    ResponsePayload::LeaseDenied => "lease_denied".to_string(),
+                    LeaseStartResult::LeaseGranted { .. } => "lease_granted".to_string(),
+                    LeaseStartResult::LeaseDenied => "lease_denied".to_string(),
                     other => panic!("unexpected lease response: {other:?}"),
                 }
             })

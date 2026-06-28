@@ -12,7 +12,7 @@ use cachebox::protocol::{
     encode_request_frame_into, encode_response_payload_view_frame_into,
 };
 use cachebox::server;
-use cachebox_client::NativeClient as OfficialNativeClient;
+use cachebox_client::{GetResult, NativeClient as OfficialNativeClient};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 #[cfg(unix)]
@@ -751,7 +751,7 @@ async fn official_sequential_get_32_round(client: &mut OfficialNativeClient, key
                 .get("default", key.to_vec())
                 .await
                 .expect("official sequential get"),
-            ResponsePayload::Hit(b"value".to_vec())
+            GetResult::Hit(b"value".to_vec())
         );
     }
 }

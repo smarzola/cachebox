@@ -48,6 +48,71 @@ impl From<DecodeError> for ClientError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetResult {
+    Hit(Vec<u8>),
+    Stale(Vec<u8>),
+    Miss,
+}
+
+impl TryFrom<ResponsePayload> for GetResult {
+    type Error = ClientError;
+
+    fn try_from(payload: ResponsePayload) -> Result<Self, Self::Error> {
+        match payload {
+            ResponsePayload::Hit(value) => Ok(Self::Hit(value)),
+            ResponsePayload::Stale(value) => Ok(Self::Stale(value)),
+            ResponsePayload::Miss => Ok(Self::Miss),
+            _ => Err(ClientError::UnexpectedResponse(
+                "get did not return hit, stale, or miss",
+            )),
+        }
+    }
+}
+
+impl From<BatchItem> for GetResult {
+    fn from(item: BatchItem) -> Self {
+        match item {
+            BatchItem::Hit(value) => Self::Hit(value),
+            BatchItem::Stale(value) => Self::Stale(value),
+            BatchItem::Miss => Self::Miss,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseStartResult {
+    Hit(Vec<u8>),
+    Stale(Vec<u8>),
+    LeaseGranted {
+        lease_token: String,
+        stale_value: Option<Vec<u8>>,
+    },
+    LeaseDenied,
+}
+
+impl TryFrom<ResponsePayload> for LeaseStartResult {
+    type Error = ClientError;
+
+    fn try_from(payload: ResponsePayload) -> Result<Self, Self::Error> {
+        match payload {
+            ResponsePayload::Hit(value) => Ok(Self::Hit(value)),
+            ResponsePayload::Stale(value) => Ok(Self::Stale(value)),
+            ResponsePayload::LeaseGranted {
+                lease_token,
+                stale_value,
+            } => Ok(Self::LeaseGranted {
+                lease_token,
+                stale_value,
+            }),
+            ResponsePayload::LeaseDenied => Ok(Self::LeaseDenied),
+            _ => Err(ClientError::UnexpectedResponse(
+                "lease start did not return a lease state",
+            )),
+        }
+    }
+}
+
 pub struct NativeClient {
     stream: NativeStream,
     next_request_id: u64,
@@ -92,6 +157,14 @@ impl NativeClient {
     }
 
     pub async fn get(
+        &mut self,
+        namespace: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<GetResult, ClientError> {
+        self.get_raw(namespace, key).await?.try_into()
+    }
+
+    pub async fn get_raw(
         &mut self,
         namespace: impl Into<String>,
         key: impl Into<Vec<u8>>,
@@ -156,6 +229,30 @@ impl NativeClient {
         &mut self,
         namespace: impl Into<String>,
         keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<GetResult>, ClientError> {
+        match self
+            .request(
+                Command::BatchGet,
+                RequestPayload::BatchGet {
+                    namespace: namespace.into(),
+                    keys,
+                },
+            )
+            .await?
+        {
+            ResponsePayload::BatchGet { items } => {
+                Ok(items.into_iter().map(GetResult::from).collect())
+            }
+            _ => Err(ClientError::UnexpectedResponse(
+                "batch get did not return batch",
+            )),
+        }
+    }
+
+    pub async fn batch_get_raw(
+        &mut self,
+        namespace: impl Into<String>,
+        keys: Vec<Vec<u8>>,
     ) -> Result<Vec<BatchItem>, ClientError> {
         match self
             .request(
@@ -197,6 +294,18 @@ impl NativeClient {
     }
 
     pub async fn start_lease(
+        &mut self,
+        namespace: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        lease_ttl_ms: u64,
+        allow_stale_ms: Option<u64>,
+    ) -> Result<LeaseStartResult, ClientError> {
+        self.start_lease_raw(namespace, key, lease_ttl_ms, allow_stale_ms)
+            .await?
+            .try_into()
+    }
+
+    pub async fn start_lease_raw(
         &mut self,
         namespace: impl Into<String>,
         key: impl Into<Vec<u8>>,
@@ -527,6 +636,57 @@ mod tests {
             })
             .expect_err("command mismatch");
 
+        assert!(matches!(error, ClientError::UnexpectedResponse(_)));
+    }
+
+    #[test]
+    fn get_result_accepts_only_get_states() {
+        assert_eq!(
+            GetResult::try_from(ResponsePayload::Hit(b"value".to_vec())).expect("hit"),
+            GetResult::Hit(b"value".to_vec())
+        );
+        assert_eq!(
+            GetResult::try_from(ResponsePayload::Stale(b"old".to_vec())).expect("stale"),
+            GetResult::Stale(b"old".to_vec())
+        );
+        assert_eq!(
+            GetResult::try_from(ResponsePayload::Miss).expect("miss"),
+            GetResult::Miss
+        );
+
+        let error =
+            GetResult::try_from(ResponsePayload::Stored { evicted: 0 }).expect_err("unexpected");
+        assert!(matches!(error, ClientError::UnexpectedResponse(_)));
+    }
+
+    #[test]
+    fn lease_start_result_accepts_only_lease_start_states() {
+        assert_eq!(
+            LeaseStartResult::try_from(ResponsePayload::Hit(b"value".to_vec())).expect("hit"),
+            LeaseStartResult::Hit(b"value".to_vec())
+        );
+        assert_eq!(
+            LeaseStartResult::try_from(ResponsePayload::Stale(b"old".to_vec())).expect("stale"),
+            LeaseStartResult::Stale(b"old".to_vec())
+        );
+        assert_eq!(
+            LeaseStartResult::try_from(ResponsePayload::LeaseGranted {
+                lease_token: "lease-1".to_string(),
+                stale_value: Some(b"old".to_vec()),
+            })
+            .expect("lease granted"),
+            LeaseStartResult::LeaseGranted {
+                lease_token: "lease-1".to_string(),
+                stale_value: Some(b"old".to_vec()),
+            }
+        );
+        assert_eq!(
+            LeaseStartResult::try_from(ResponsePayload::LeaseDenied).expect("lease denied"),
+            LeaseStartResult::LeaseDenied
+        );
+
+        let error = LeaseStartResult::try_from(ResponsePayload::Stored { evicted: 0 })
+            .expect_err("unexpected");
         assert!(matches!(error, ClientError::UnexpectedResponse(_)));
     }
 }

@@ -127,8 +127,8 @@ native TCP: 127.0.0.1:7401
 Store and read bytes with the Rust native client:
 
 ```rust
-use cachebox::protocol::{Metadata, ResponsePayload, Ttl};
-use cachebox_client::NativeClient;
+use cachebox::protocol::{Metadata, Ttl};
+use cachebox_client::{GetResult, NativeClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -154,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let value = client.get("default", b"user:123".to_vec()).await?;
-    assert_eq!(value, ResponsePayload::Hit(b"cached bytes".to_vec()));
+    assert_eq!(value, GetResult::Hit(b"cached bytes".to_vec()));
 
     Ok(())
 }
