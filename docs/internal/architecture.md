@@ -82,6 +82,11 @@ supports:
 Keys are byte vectors. Namespaces and tags are validated strings. Values remain
 raw bytes.
 
+Native TCP sockets set `TCP_NODELAY` on accepted connections. Native response
+writes are opportunistically coalesced when multiple completed responses are
+already queued for a connection. Coalescing is bounded and does not change
+request ordering semantics; clients still match responses by `request_id`.
+
 The protocol is specified in [native-socket-protocol.md](native-socket-protocol.md).
 
 ## Cache Engine

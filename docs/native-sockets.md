@@ -12,7 +12,8 @@ cargo run --bin cachebox -- \
 ```
 
 `127.0.0.1:7401` is the default native TCP listener, so `cargo run --bin
-cachebox` is enough for local TCP use.
+cachebox` is enough for local TCP use. Accepted native TCP connections use
+`TCP_NODELAY`.
 
 ## Start Unix Socket
 

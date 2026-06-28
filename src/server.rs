@@ -35,6 +35,8 @@ use crate::protocol::{
 };
 
 const MAX_IN_FLIGHT_PER_CONNECTION: usize = 128;
+const MAX_RESPONSE_WRITE_BATCH_FRAMES: usize = 32;
+const MAX_RESPONSE_WRITE_BATCH_BYTES: usize = 64 * 1024;
 const METRIC_SHARD_COUNT: usize = 64;
 static NEXT_NATIVE_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -337,6 +339,7 @@ async fn run_native_tcp_listener(
 ) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
         let state = state.clone();
         tokio::spawn(async move {
             let _ = handle_native_connection(stream, state, max_payload_len).await;
@@ -403,6 +406,7 @@ where
 
     let writer_task = tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
+            let response = coalesce_native_responses(response, &mut response_rx);
             writer.write_all(&response).await?;
         }
         std::io::Result::Ok(())
@@ -427,6 +431,26 @@ where
     writer_task
         .await
         .map_err(|error| io::Error::other(format!("native writer task failed: {error}")))?
+}
+
+fn coalesce_native_responses(first: Vec<u8>, response_rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    let mut batch = first;
+    let mut frames = 1;
+    while frames < MAX_RESPONSE_WRITE_BATCH_FRAMES && batch.len() < MAX_RESPONSE_WRITE_BATCH_BYTES {
+        match response_rx.try_recv() {
+            Ok(response) => {
+                let exceeds_batch_bytes =
+                    batch.len().saturating_add(response.len()) > MAX_RESPONSE_WRITE_BATCH_BYTES;
+                batch.extend_from_slice(&response);
+                frames += 1;
+                if exceeds_batch_bytes {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    batch
 }
 
 async fn read_native_frame<R>(
@@ -1100,6 +1124,19 @@ mod tests {
         assert_eq!(snapshot.requests_total, 1);
         assert_eq!(snapshot.get_requests, 1);
         assert_eq!(snapshot.hits_total, 1);
+    }
+
+    #[test]
+    fn coalesce_native_responses_drains_queued_frames_in_order() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(vec![3, 4]).expect("second response");
+        tx.try_send(vec![5]).expect("third response");
+        drop(tx);
+
+        assert_eq!(
+            coalesce_native_responses(vec![1, 2], &mut rx),
+            vec![1, 2, 3, 4, 5]
+        );
     }
 
     #[tokio::test]
