@@ -1,11 +1,18 @@
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use cachebox_client::ai::{
+    EmbeddingCacheKeyInput, PromptCacheKeyInput, PromptMessage, embedding_cache_key,
+    prompt_cache_key,
+};
 use cachebox_client::{
     ClientError, GetResult as RustGetResult, LeaseStartResult as RustLeaseStartResult, NativeClient,
 };
 use cachebox_protocol::{ContentType, ErrorCode, Metadata as RustMetadata, Ttl};
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyDict, PyFloat, PyList, PyString};
+use serde_json::{Number, Value};
 use tokio::runtime::Runtime;
 
 pyo3::create_exception!(_cachebox, CacheboxError, PyException);
@@ -352,12 +359,167 @@ fn error_code_name(code: ErrorCode) -> &'static str {
     }
 }
 
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    provider,
+    model,
+    application_namespace,
+    messages,
+    model_version=None,
+    system_prompt=None,
+    tool_schema=None,
+    sampling_parameters=None,
+    output_format=None,
+    retrieval_context_hash=None
+))]
+fn ai_prompt_cache_key(
+    provider: String,
+    model: String,
+    application_namespace: String,
+    messages: &Bound<'_, PyAny>,
+    model_version: Option<String>,
+    system_prompt: Option<String>,
+    tool_schema: Option<&Bound<'_, PyAny>>,
+    sampling_parameters: Option<&Bound<'_, PyAny>>,
+    output_format: Option<String>,
+    retrieval_context_hash: Option<String>,
+) -> PyResult<Vec<u8>> {
+    let mut input = PromptCacheKeyInput::new(provider, model, application_namespace);
+    input.model_version = model_version;
+    input.system_prompt = system_prompt;
+    input.messages = prompt_messages_from_py(messages)?;
+    input.tool_schema = tool_schema.map(json_from_py).transpose()?;
+    input.sampling_parameters = json_map_from_py(sampling_parameters)?;
+    input.output_format = output_format;
+    input.retrieval_context_hash = retrieval_context_hash;
+    Ok(prompt_cache_key(&input))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    model,
+    input_content_hash,
+    chunking_strategy,
+    dimensions,
+    application_namespace,
+    model_version=None,
+    normalization_settings=None
+))]
+fn ai_embedding_cache_key(
+    model: String,
+    input_content_hash: String,
+    chunking_strategy: String,
+    dimensions: u32,
+    application_namespace: String,
+    model_version: Option<String>,
+    normalization_settings: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Vec<u8>> {
+    let mut input = EmbeddingCacheKeyInput::new(
+        model,
+        input_content_hash,
+        chunking_strategy,
+        dimensions,
+        application_namespace,
+    );
+    input.model_version = model_version;
+    input.normalization_settings = json_map_from_py(normalization_settings)?;
+    Ok(embedding_cache_key(&input))
+}
+
+fn prompt_messages_from_py(messages: &Bound<'_, PyAny>) -> PyResult<Vec<PromptMessage>> {
+    let list = messages.downcast::<PyList>().map_err(|_| {
+        PyValueError::new_err("messages must be a list of dictionaries with role/content fields")
+    })?;
+    list.iter()
+        .map(|item| {
+            let dict = item.downcast::<PyDict>().map_err(|_| {
+                PyValueError::new_err(
+                    "messages must be a list of dictionaries with role/content fields",
+                )
+            })?;
+            let role = required_string(dict, "role")?;
+            let content = required_string(dict, "content")?;
+            let name = optional_string(dict, "name")?;
+            Ok(PromptMessage {
+                role,
+                content,
+                name,
+            })
+        })
+        .collect()
+}
+
+fn required_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
+    dict.get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("missing required field {key:?}")))?
+        .extract()
+}
+
+fn optional_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
+    dict.get_item(key)?.map(|value| value.extract()).transpose()
+}
+
+fn json_map_from_py(value: Option<&Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, Value>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let dict = value
+        .downcast::<PyDict>()
+        .map_err(|_| PyValueError::new_err("expected a dictionary"))?;
+    let mut out = BTreeMap::new();
+    for (key, value) in dict.iter() {
+        out.insert(key.extract::<String>()?, json_from_py(&value)?);
+    }
+    Ok(out)
+}
+
+fn json_from_py(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if value.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(value) = value.extract::<bool>() {
+        return Ok(Value::Bool(value));
+    }
+    if let Ok(value) = value.extract::<i64>() {
+        return Ok(Value::Number(Number::from(value)));
+    }
+    if let Ok(value) = value.extract::<u64>() {
+        return Ok(Value::Number(Number::from(value)));
+    }
+    if value.downcast::<PyFloat>().is_ok() {
+        let value = value.extract::<f64>()?;
+        let number = Number::from_f64(value)
+            .ok_or_else(|| PyValueError::new_err("JSON numbers must be finite"))?;
+        return Ok(Value::Number(number));
+    }
+    if value.downcast::<PyString>().is_ok() {
+        return Ok(Value::String(value.extract()?));
+    }
+    if let Ok(list) = value.downcast::<PyList>() {
+        return list.iter().map(|item| json_from_py(&item)).collect();
+    }
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        let mut out = serde_json::Map::new();
+        for (key, value) in dict.iter() {
+            out.insert(key.extract::<String>()?, json_from_py(&value)?);
+        }
+        return Ok(Value::Object(out));
+    }
+
+    Err(PyValueError::new_err(
+        "expected a JSON-compatible value: None, bool, int, float, str, list, or dict",
+    ))
+}
+
 #[pymodule]
 fn _cachebox(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Client>()?;
     module.add_class::<GetResult>()?;
     module.add_class::<LeaseStartResult>()?;
     module.add_class::<Metadata>()?;
+    module.add_function(wrap_pyfunction!(ai_prompt_cache_key, module)?)?;
+    module.add_function(wrap_pyfunction!(ai_embedding_cache_key, module)?)?;
     module.add("CacheboxError", py.get_type::<CacheboxError>())?;
     module.add("ServerError", py.get_type::<ServerError>())?;
     Ok(())

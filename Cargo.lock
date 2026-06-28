@@ -106,6 +106,7 @@ dependencies = [
  "cachebox-client",
  "cachebox-protocol",
  "pyo3",
+ "serde_json",
  "tokio",
 ]
 

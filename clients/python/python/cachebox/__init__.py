@@ -5,6 +5,8 @@ from ._cachebox import (
     LeaseStartResult,
     Metadata,
     ServerError,
+    ai_embedding_cache_key,
+    ai_prompt_cache_key,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "LeaseStartResult",
     "Metadata",
     "ServerError",
+    "ai_embedding_cache_key",
+    "ai_prompt_cache_key",
 ]
