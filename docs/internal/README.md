@@ -17,6 +17,7 @@ the top-level `docs/` files are the user-facing documentation.
 - [Performance uplift baseline](performance-uplift-baseline.md)
 - [Performance uplift borrowed decode](performance-uplift-borrowed-decode.md)
 - [Performance phase 2 goal loop](performance-phase-2-goal-loop.md)
+- [Performance phase 2 baseline](performance-phase-2-baseline.md)
 - [Performance uplift goal loop](performance-uplift-goal-loop.md)
 - [Performance uplift metrics](performance-uplift-metrics.md)
 - [Performance uplift pipelining](performance-uplift-pipelining.md)

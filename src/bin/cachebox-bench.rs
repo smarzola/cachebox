@@ -9,7 +9,8 @@ use cachebox::config::Config;
 use cachebox::engine::{Engine, GetOutcome, PutCommand};
 use cachebox::protocol::{
     BatchItem, Command, HEADER_LEN, Metadata, RequestFrame, RequestPayload, ResponsePayload,
-    decode_response_frame, encode_request_frame_into,
+    ResponsePayloadView, decode_request_frame, decode_response_frame, encode_request_frame_into,
+    encode_response_payload_view_frame_into,
 };
 use cachebox::server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,6 +18,7 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 
 const WARMUP_ITERS: usize = 100;
 const MEASURE_DURATION: Duration = Duration::from_secs(1);
@@ -64,6 +66,11 @@ async fn async_main() {
         bench_engine_get(),
         bench_engine_put(),
         bench_engine_tag_invalidate_8(),
+        bench_protocol_decode_get(),
+        bench_protocol_encode_hit(),
+        bench_engine_get_ref_encode(),
+        bench_tokio_spawn_ready().await,
+        bench_tokio_spawn_mpsc_response().await,
         bench_native_single_key_get(&mut native_client).await,
         bench_native_single_key_put(&mut native_client).await,
         bench_native_batch_get(&mut native_client).await,
@@ -188,6 +195,139 @@ fn bench_engine_tag_invalidate_8() -> BenchResult {
         0,
     );
     with_memory(result, engine.memory_used_bytes())
+}
+
+fn bench_protocol_decode_get() -> BenchResult {
+    let mut frame = Vec::new();
+    encode_request_frame_into(
+        &RequestFrame {
+            request_id: 1,
+            command: Command::Get,
+            payload: native_get_payload(b"decode-key"),
+        },
+        &mut frame,
+    );
+    warmup_sync(|| {
+        let decoded = decode_request_frame(&frame, usize::MAX).expect("get frame should decode");
+        assert_eq!(decoded.command, Command::Get);
+    });
+    measure_process_sync("protocol_decode_get", "decode_prebuilt_get_frame", || {
+        let decoded = decode_request_frame(&frame, usize::MAX).expect("get frame should decode");
+        assert_eq!(decoded.command, Command::Get);
+    })
+}
+
+fn bench_protocol_encode_hit() -> BenchResult {
+    let value = b"value";
+    let mut out = Vec::new();
+    warmup_sync(|| {
+        encode_response_payload_view_frame_into(
+            1,
+            Command::Get,
+            ResponsePayloadView::Hit(value),
+            &mut out,
+        );
+    });
+    measure_process_sync(
+        "protocol_encode_hit",
+        "encode_borrowed_hit_response",
+        || {
+            encode_response_payload_view_frame_into(
+                1,
+                Command::Get,
+                ResponsePayloadView::Hit(value),
+                &mut out,
+            );
+        },
+    )
+}
+
+fn bench_engine_get_ref_encode() -> BenchResult {
+    let mut engine = Engine::new();
+    engine
+        .put(put_command("bench", b"get-ref-encode", b"value"))
+        .expect("engine put should fit");
+    let mut out = Vec::new();
+    warmup_sync(|| {
+        engine.get_ref("bench", b"get-ref-encode", |outcome| match outcome {
+            cachebox::engine::GetOutcomeRef::Hit(value) => encode_response_payload_view_frame_into(
+                1,
+                Command::Get,
+                ResponsePayloadView::Hit(value),
+                &mut out,
+            ),
+            other => panic!("expected hit, got {other:?}"),
+        });
+    });
+    let result = measure_process_sync(
+        "engine_get_ref_encode",
+        "engine_get_ref_plus_borrowed_encode",
+        || {
+            engine.get_ref("bench", b"get-ref-encode", |outcome| match outcome {
+                cachebox::engine::GetOutcomeRef::Hit(value) => {
+                    encode_response_payload_view_frame_into(
+                        1,
+                        Command::Get,
+                        ResponsePayloadView::Hit(value),
+                        &mut out,
+                    );
+                }
+                other => panic!("expected hit, got {other:?}"),
+            });
+        },
+    );
+    with_memory(result, engine.memory_used_bytes())
+}
+
+async fn bench_tokio_spawn_ready() -> BenchResult {
+    for _ in 0..WARMUP_ITERS {
+        tokio::spawn(async {}).await.expect("spawn should join");
+    }
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let sample_started = Instant::now();
+        tokio::spawn(async {}).await.expect("spawn should join");
+        samples.push(sample_started.elapsed());
+    }
+    summarize(
+        "tokio_spawn_ready",
+        "process",
+        "spawn_empty_task_and_join",
+        samples,
+        started.elapsed(),
+        0,
+    )
+}
+
+async fn bench_tokio_spawn_mpsc_response() -> BenchResult {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+    for _ in 0..WARMUP_ITERS {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            tx.send(Vec::new()).await.expect("warmup send");
+        });
+        rx.recv().await.expect("warmup recv");
+    }
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let tx = tx.clone();
+        let sample_started = Instant::now();
+        tokio::spawn(async move {
+            tx.send(Vec::new()).await.expect("benchmark send");
+        });
+        rx.recv().await.expect("benchmark recv");
+        samples.push(sample_started.elapsed());
+    }
+    summarize(
+        "tokio_spawn_mpsc_response",
+        "process",
+        "spawn_task_send_response_vec",
+        samples,
+        started.elapsed(),
+        0,
+    )
 }
 
 async fn bench_native_single_key_get(client: &mut NativeClient) -> BenchResult {
@@ -913,6 +1053,21 @@ fn measure_sync(
         samples.push(sample_started.elapsed());
     }
     summarize(name, "engine", notes, samples, started.elapsed(), 0)
+}
+
+fn measure_process_sync(
+    name: &'static str,
+    notes: &'static str,
+    mut operation: impl FnMut(),
+) -> BenchResult {
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let sample_started = Instant::now();
+        operation();
+        samples.push(sample_started.elapsed());
+    }
+    summarize(name, "process", notes, samples, started.elapsed(), 0)
 }
 
 fn put_command(namespace: &str, key: &[u8], value: &[u8]) -> PutCommand {
