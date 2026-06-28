@@ -403,6 +403,8 @@ where
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (response_tx, mut response_rx) = mpsc::channel::<Vec<u8>>(MAX_IN_FLIGHT_PER_CONNECTION);
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONNECTION));
+    let mut read_buffer = Vec::with_capacity(HEADER_LEN + 1024);
+    let mut pipelined = false;
 
     let writer_task = tokio::spawn(async move {
         while let Some(response) = response_rx.recv().await {
@@ -412,19 +414,38 @@ where
         std::io::Result::Ok(())
     });
 
-    while let Some(frame) = read_native_frame(&mut reader, max_payload_len).await? {
-        let permit = Arc::clone(&in_flight)
-            .acquire_owned()
-            .await
-            .expect("connection semaphore should stay open");
-        let state = state.clone();
-        let response_tx = response_tx.clone();
-        tokio::spawn(async move {
-            let response =
-                execute_native_frame_bytes(&state, &frame, max_payload_len, connection_id);
-            let _ = response_tx.send(response).await;
-            drop(permit);
-        });
+    while let Some(frames) =
+        read_native_frame_batch(&mut reader, &mut read_buffer, max_payload_len).await?
+    {
+        if frames.len() > 1 {
+            pipelined = true;
+        }
+
+        if !pipelined {
+            for frame in frames {
+                let response =
+                    execute_native_frame_bytes(&state, &frame, max_payload_len, connection_id);
+                if response_tx.send(response).await.is_err() {
+                    return Ok(());
+                }
+            }
+            continue;
+        }
+
+        for frame in frames {
+            let permit = Arc::clone(&in_flight)
+                .acquire_owned()
+                .await
+                .expect("connection semaphore should stay open");
+            let state = state.clone();
+            let response_tx = response_tx.clone();
+            tokio::spawn(async move {
+                let response =
+                    execute_native_frame_bytes(&state, &frame, max_payload_len, connection_id);
+                let _ = response_tx.send(response).await;
+                drop(permit);
+            });
+        }
     }
 
     drop(response_tx);
@@ -453,31 +474,63 @@ fn coalesce_native_responses(first: Vec<u8>, response_rx: &mut mpsc::Receiver<Ve
     batch
 }
 
-async fn read_native_frame<R>(
+async fn read_native_frame_batch<R>(
     reader: &mut R,
+    buffer: &mut Vec<u8>,
     max_payload_len: usize,
-) -> std::io::Result<Option<Vec<u8>>>
+) -> std::io::Result<Option<Vec<Vec<u8>>>>
 where
     R: AsyncRead + Unpin,
 {
-    let mut header = [0; HEADER_LEN];
-    match reader.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
+    loop {
+        match drain_complete_native_frames(buffer, max_payload_len) {
+            FrameDrain::Frames(frames) => return Ok(Some(frames)),
+            FrameDrain::Close => return Ok(None),
+            FrameDrain::NeedMore => {}
+        }
+
+        let read = reader.read_buf(buffer).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+    }
+}
+
+enum FrameDrain {
+    Frames(Vec<Vec<u8>>),
+    NeedMore,
+    Close,
+}
+
+fn drain_complete_native_frames(buffer: &mut Vec<u8>, max_payload_len: usize) -> FrameDrain {
+    let mut frames = Vec::new();
+    let mut offset = 0;
+    while buffer.len().saturating_sub(offset) >= HEADER_LEN {
+        let payload_len = u32::from_be_bytes(
+            buffer[offset + 16..offset + 20]
+                .try_into()
+                .expect("slice length"),
+        ) as usize;
+        if payload_len > max_payload_len {
+            return FrameDrain::Close;
+        }
+
+        let frame_len = HEADER_LEN + payload_len;
+        if buffer.len().saturating_sub(offset) < frame_len {
+            break;
+        }
+        frames.push(buffer[offset..offset + frame_len].to_vec());
+        offset += frame_len;
     }
 
-    let payload_len = u32::from_be_bytes(header[16..20].try_into().expect("slice length")) as usize;
-    if payload_len > max_payload_len {
-        return Ok(None);
+    if offset > 0 {
+        buffer.drain(..offset);
     }
-
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload_len);
-    frame.extend_from_slice(&header);
-    let start = frame.len();
-    frame.resize(HEADER_LEN + payload_len, 0);
-    reader.read_exact(&mut frame[start..]).await?;
-    Ok(Some(frame))
+    if frames.is_empty() {
+        FrameDrain::NeedMore
+    } else {
+        FrameDrain::Frames(frames)
+    }
 }
 
 fn execute_native_frame_bytes(
@@ -1137,6 +1190,54 @@ mod tests {
             coalesce_native_responses(vec![1, 2], &mut rx),
             vec![1, 2, 3, 4, 5]
         );
+    }
+
+    #[test]
+    fn drain_complete_native_frames_returns_all_buffered_frames() {
+        let first = encode_request_frame(&NativeRequestFrame {
+            request_id: 1,
+            command: Command::Get,
+            payload: RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"a".to_vec(),
+            },
+        });
+        let second = encode_request_frame(&NativeRequestFrame {
+            request_id: 2,
+            command: Command::Get,
+            payload: RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"b".to_vec(),
+            },
+        });
+        let mut buffer = [first.as_slice(), second.as_slice()].concat();
+
+        let FrameDrain::Frames(frames) = drain_complete_native_frames(&mut buffer, 8192) else {
+            panic!("expected complete frames");
+        };
+
+        assert_eq!(frames, vec![first, second]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn drain_complete_native_frames_keeps_partial_frame_buffered() {
+        let frame = encode_request_frame(&NativeRequestFrame {
+            request_id: 1,
+            command: Command::Get,
+            payload: RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"a".to_vec(),
+            },
+        });
+        let split = frame.len() - 3;
+        let mut buffer = frame[..split].to_vec();
+
+        assert!(matches!(
+            drain_complete_native_frames(&mut buffer, 8192),
+            FrameDrain::NeedMore
+        ));
+        assert_eq!(buffer, frame[..split]);
     }
 
     #[tokio::test]
