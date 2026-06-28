@@ -16,6 +16,7 @@ the top-level `docs/` files are the user-facing documentation.
 - [Native socket transport goal loop](native-socket-goal-loop.md)
 - [Performance uplift baseline](performance-uplift-baseline.md)
 - [Performance uplift borrowed decode](performance-uplift-borrowed-decode.md)
+- [Performance phase 2 goal loop](performance-phase-2-goal-loop.md)
 - [Performance uplift goal loop](performance-uplift-goal-loop.md)
 - [Performance uplift metrics](performance-uplift-metrics.md)
 - [Performance uplift pipelining](performance-uplift-pipelining.md)
