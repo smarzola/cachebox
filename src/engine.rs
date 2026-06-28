@@ -3,13 +3,17 @@
 //! The MVP engine stores byte keys and values with lazy expiration. Networking
 //! and request parsing stay outside this module.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::Ttl;
 
 const ENTRY_OVERHEAD_BYTES: usize = 96;
 const LRU_SAMPLE_SIZE: usize = 16;
+pub const DEFAULT_SHARD_COUNT: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
@@ -58,6 +62,181 @@ impl Engine<SystemClock> {
 impl Default for Engine<SystemClock> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug)]
+pub struct ShardedEngine<C = SystemClock>
+where
+    C: Clock,
+{
+    shards: Vec<Mutex<Engine<C>>>,
+    limits: EngineLimits,
+}
+
+impl ShardedEngine<SystemClock> {
+    pub fn with_limits(limits: EngineLimits) -> Self {
+        Self::with_clock_and_limits(SystemClock, limits, DEFAULT_SHARD_COUNT)
+    }
+}
+
+impl<C> ShardedEngine<C>
+where
+    C: Clock,
+{
+    pub fn with_clock_and_limits(clock: C, limits: EngineLimits, shard_count: usize) -> Self {
+        assert!(shard_count > 0, "sharded engine needs at least one shard");
+        let shard_limits = EngineLimits {
+            max_memory_bytes: limits.max_memory_bytes.div_ceil(shard_count),
+            max_value_bytes: limits.max_value_bytes,
+        };
+        let shards = (0..shard_count)
+            .map(|_| Mutex::new(Engine::with_clock_and_limits(clock.clone(), shard_limits)))
+            .collect();
+        Self { shards, limits }
+    }
+
+    pub fn put(&self, command: PutCommand) -> Result<PutOutcome, PutError> {
+        self.shard_for(&command.namespace, &command.key)
+            .lock()
+            .expect("engine shard mutex poisoned")
+            .put(command)
+    }
+
+    pub fn get(&self, namespace: &str, key: &[u8]) -> GetOutcome {
+        self.shard_for(namespace, key)
+            .lock()
+            .expect("engine shard mutex poisoned")
+            .get(namespace, key)
+    }
+
+    pub fn get_ref<R>(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        map: impl FnOnce(GetOutcomeRef<'_>) -> R,
+    ) -> R {
+        self.shard_for(namespace, key)
+            .lock()
+            .expect("engine shard mutex poisoned")
+            .get_ref(namespace, key, map)
+    }
+
+    pub fn delete(&self, namespace: &str, key: &[u8]) -> bool {
+        self.shard_for(namespace, key)
+            .lock()
+            .expect("engine shard mutex poisoned")
+            .delete(namespace, key)
+    }
+
+    pub fn batch_get(&self, namespace: &str, keys: &[Vec<u8>]) -> Vec<GetOutcome> {
+        keys.iter().map(|key| self.get(namespace, key)).collect()
+    }
+
+    pub fn invalidate_tag(&self, namespace: &str, tag: &str) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .expect("engine shard mutex poisoned")
+                    .invalidate_tag(namespace, tag)
+            })
+            .sum()
+    }
+
+    pub fn start_lease(&self, namespace: &str, key: &[u8], lease_ttl_ms: u64) -> StartLeaseOutcome {
+        self.shard_for(namespace, key)
+            .lock()
+            .expect("engine shard mutex poisoned")
+            .start_lease(namespace, key, lease_ttl_ms)
+    }
+
+    pub fn complete_lease(
+        &self,
+        command: CompleteLeaseCommand,
+    ) -> Result<PutOutcome, CompleteLeaseError> {
+        self.shard_for(&command.namespace, &command.key)
+            .lock()
+            .expect("engine shard mutex poisoned")
+            .complete_lease(command)
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().expect("engine shard mutex poisoned").len())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn memory_used_bytes(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .expect("engine shard mutex poisoned")
+                    .memory_used_bytes()
+            })
+            .sum()
+    }
+
+    pub fn cost_score_total(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .expect("engine shard mutex poisoned")
+                    .cost_score_total()
+            })
+            .sum()
+    }
+
+    pub fn limits(&self) -> EngineLimits {
+        self.limits
+    }
+
+    pub fn stats(&self) -> EngineStats {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().expect("engine shard mutex poisoned").stats())
+            .fold(EngineStats::default(), |mut total, stats| {
+                total.expirations = total.expirations.saturating_add(stats.expirations);
+                total.evictions = total.evictions.saturating_add(stats.evictions);
+                total
+            })
+    }
+
+    pub fn reclaim_expired_budget(&self, max_entries: usize) -> usize {
+        if max_entries == 0 {
+            return 0;
+        }
+        let mut remaining = max_entries;
+        let mut removed = 0;
+        for shard in &self.shards {
+            if remaining == 0 {
+                break;
+            }
+            let shard_removed = shard
+                .lock()
+                .expect("engine shard mutex poisoned")
+                .reclaim_expired_budget(remaining);
+            removed += shard_removed;
+            remaining = remaining.saturating_sub(shard_removed);
+        }
+        removed
+    }
+
+    fn shard_for(&self, namespace: &str, key: &[u8]) -> &Mutex<Engine<C>> {
+        let mut hasher = DefaultHasher::new();
+        namespace.hash(&mut hasher);
+        key.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) % self.shards.len()]
     }
 }
 
@@ -705,6 +884,18 @@ mod tests {
         )
     }
 
+    fn sharded_engine(shard_count: usize) -> (ShardedEngine<ManualClock>, ManualClock) {
+        let clock = ManualClock::new(1_000);
+        (
+            ShardedEngine::with_clock_and_limits(
+                clock.clone(),
+                EngineLimits::default(),
+                shard_count,
+            ),
+            clock,
+        )
+    }
+
     fn put(namespace: &str, key: &[u8], value: &[u8]) -> PutCommand {
         PutCommand {
             namespace: namespace.to_string(),
@@ -715,6 +906,60 @@ mod tests {
             tags: Vec::new(),
             cost: None,
         }
+    }
+
+    #[test]
+    fn sharded_engine_invalidates_tag_across_shards() {
+        let (engine, _) = sharded_engine(8);
+        for index in 0..64 {
+            let mut command = put("default", format!("key-{index}").as_bytes(), b"value");
+            command.tags = vec!["group".to_string()];
+            engine.put(command).expect("put should fit");
+        }
+
+        assert_eq!(engine.len(), 64);
+        assert_eq!(engine.invalidate_tag("default", "group"), 64);
+        assert_eq!(engine.len(), 0);
+        for index in 0..64 {
+            assert_eq!(
+                engine.get("default", format!("key-{index}").as_bytes()),
+                GetOutcome::Miss
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_engine_reclaim_expired_budget_is_global() {
+        let (engine, clock) = sharded_engine(8);
+        for index in 0..16 {
+            let mut command = put("default", format!("key-{index}").as_bytes(), b"value");
+            command.ttl = Some(Ttl { milliseconds: 1 });
+            engine.put(command).expect("put should fit");
+        }
+
+        clock.advance(2);
+
+        assert_eq!(engine.reclaim_expired_budget(5), 5);
+        assert_eq!(engine.stats().expirations, 5);
+        assert_eq!(engine.len(), 11);
+        assert_eq!(engine.reclaim_expired_budget(usize::MAX), 11);
+        assert_eq!(engine.stats().expirations, 16);
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[test]
+    fn sharded_engine_aggregates_memory_and_cost_metrics() {
+        let (engine, _) = sharded_engine(8);
+        let mut first = put("default", b"a", b"value");
+        first.cost = Some(10);
+        engine.put(first).expect("put should fit");
+        let mut second = put("default", b"b", b"value");
+        second.cost = Some(7);
+        engine.put(second).expect("put should fit");
+
+        assert!(engine.memory_used_bytes() > 0);
+        assert_eq!(engine.cost_score_total(), 17);
+        assert_eq!(engine.limits(), EngineLimits::default());
     }
 
     #[test]

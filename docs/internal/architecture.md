@@ -27,10 +27,8 @@ admin HTTP listener
   -> /metrics
 ```
 
-The current implementation uses a single shared engine protected by a mutex.
-That keeps correctness straightforward while the transport and cache semantics
-are being established. The performance-oriented design should move to sharded
-ownership:
+The server uses a fixed set of engine shards. Each shard owns its own map,
+expiry index, tag index, lease state, eviction state, and lock:
 
 ```text
 native connection task
@@ -41,7 +39,9 @@ native connection task
 ```
 
 Each shard should own its data so ordinary read and write paths avoid global
-locks. Batch operations can fan out to multiple shards.
+locks. Batch operations fan out through per-key shard selection. Tag
+invalidation visits every shard because tag indexes are shard-local. Memory
+pressure is enforced per shard; metrics aggregate shard state at scrape time.
 
 ## Current Module Baseline
 
@@ -165,6 +165,6 @@ This lets application clients use a simple flow:
 
 ## Future Shape
 
-The engine should stay transport-independent. Future work can add sharding,
-official clients, namespace policies, additional admin diagnostics, or optional
-adapters without moving cache semantics back into HTTP routing.
+The engine should stay transport-independent. Future work can add official
+clients, namespace policies, additional admin diagnostics, or optional adapters
+without moving cache semantics back into HTTP routing.

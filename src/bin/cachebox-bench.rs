@@ -74,6 +74,7 @@ async fn async_main() {
         bench_native_ttl_heavy_writes(&mut native_client).await,
         bench_native_pipelined_get(&mut native_client).await,
         bench_native_concurrent_get_tcp(&native_server.addr).await,
+        bench_native_concurrent_get_distinct_tcp(&native_server.addr).await,
         bench_native_concurrent_put_tcp(&native_server.addr).await,
         bench_native_short_connection_get_tcp(&native_server.addr).await,
     ];
@@ -93,6 +94,7 @@ async fn async_main() {
             bench_native_ttl_heavy_writes(&mut native_unix_client).await,
             bench_native_pipelined_get(&mut native_unix_client).await,
             bench_native_concurrent_get_unix(&native_unix_server.path).await,
+            bench_native_concurrent_get_distinct_unix(&native_unix_server.path).await,
             bench_native_concurrent_put_unix(&native_unix_server.path).await,
             bench_native_short_connection_get_unix(&native_unix_server.path).await,
         ]);
@@ -488,11 +490,40 @@ async fn bench_native_concurrent_get_tcp(addr: &str) -> BenchResult {
     .await
 }
 
+async fn bench_native_concurrent_get_distinct_tcp(addr: &str) -> BenchResult {
+    let mut setup = NativeClient::connect_tcp(addr).await;
+    let addr = addr.to_string();
+    bench_native_concurrent_get_distinct(
+        "loopback_tcp",
+        move || {
+            let addr = addr.clone();
+            async move { NativeClient::connect_tcp(&addr).await }
+        },
+        &mut setup,
+    )
+    .await
+}
+
 #[cfg(unix)]
 async fn bench_native_concurrent_get_unix(path: &Path) -> BenchResult {
     let mut setup = NativeClient::connect_unix(path).await;
     let path = path.to_path_buf();
     bench_native_concurrent_get(
+        "loopback_unix",
+        move || {
+            let path = path.clone();
+            async move { NativeClient::connect_unix(&path).await }
+        },
+        &mut setup,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn bench_native_concurrent_get_distinct_unix(path: &Path) -> BenchResult {
+    let mut setup = NativeClient::connect_unix(path).await;
+    let path = path.to_path_buf();
+    bench_native_concurrent_get_distinct(
         "loopback_unix",
         move || {
             let path = path.clone();
@@ -595,6 +626,60 @@ where
         "concurrent_get_16",
         transport,
         "16_clients_cached_hit",
+        started,
+        handles,
+    )
+    .await
+}
+
+async fn bench_native_concurrent_get_distinct<F, Fut>(
+    transport: &'static str,
+    connect: F,
+    setup: &mut NativeClient,
+) -> BenchResult
+where
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = NativeClient> + Send + 'static,
+{
+    for client_index in 0..CONCURRENT_CLIENTS {
+        let key = format!("concurrent-get-distinct-{client_index}");
+        assert_eq!(
+            setup
+                .request(
+                    Command::Put,
+                    native_put_payload(key.as_bytes(), Metadata::default(), b"value")
+                )
+                .await,
+            ResponsePayload::Stored { evicted: 0 }
+        );
+    }
+
+    let started = Instant::now();
+    let deadline = started + MEASURE_DURATION;
+    let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
+    for client_index in 0..CONCURRENT_CLIENTS {
+        let connect = connect.clone();
+        handles.push(tokio::spawn(async move {
+            let mut client = connect().await;
+            let key = format!("concurrent-get-distinct-{client_index}");
+            let mut samples = Vec::new();
+            while Instant::now() < deadline {
+                let sample_started = Instant::now();
+                assert_eq!(
+                    client
+                        .request(Command::Get, native_get_payload(key.as_bytes()))
+                        .await,
+                    ResponsePayload::Hit(b"value".to_vec())
+                );
+                samples.push(sample_started.elapsed());
+            }
+            samples
+        }));
+    }
+    summarize_joined_samples(
+        "concurrent_get_16_distinct",
+        transport,
+        "16_clients_distinct_cached_hits",
         started,
         handles,
     )

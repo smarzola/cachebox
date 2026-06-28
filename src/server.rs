@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{OriginalUri, State};
@@ -24,8 +24,8 @@ use tokio::time::MissedTickBehavior;
 
 use crate::config::Config;
 use crate::engine::{
-    CompleteLeaseCommand, CompleteLeaseError, Engine, EngineLimits, GetOutcome, GetOutcomeRef,
-    PutCommand, PutError, StartLeaseOutcome,
+    CompleteLeaseCommand, CompleteLeaseError, EngineLimits, GetOutcome, GetOutcomeRef, PutCommand,
+    PutError, ShardedEngine, StartLeaseOutcome,
 };
 use crate::protocol::{
     BatchItem, Command, DecodeError, ErrorCode, HEADER_LEN, Metadata as NativeMetadata,
@@ -50,17 +50,17 @@ pub struct StartupReport {
 
 #[derive(Clone)]
 pub struct AppState {
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<ShardedEngine>,
     metrics: Arc<Metrics>,
 }
 
 impl AppState {
     fn from_config(config: &Config) -> Self {
         Self {
-            engine: Arc::new(Mutex::new(Engine::with_limits(EngineLimits {
+            engine: Arc::new(ShardedEngine::with_limits(EngineLimits {
                 max_memory_bytes: config.max_memory_bytes,
                 max_value_bytes: config.max_value_bytes,
-            }))),
+            })),
             metrics: Arc::new(Metrics::default()),
         }
     }
@@ -255,7 +255,7 @@ async fn shutdown_signal() {
 }
 
 fn spawn_expiration_worker(
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<ShardedEngine>,
     interval_ms: u64,
     max_entries_per_tick: usize,
 ) -> Option<JoinHandle<()>> {
@@ -268,10 +268,7 @@ fn spawn_expiration_worker(
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .reclaim_expired_budget(max_entries_per_tick);
+            engine.reclaim_expired_budget(max_entries_per_tick);
         }
     }))
 }
@@ -493,11 +490,7 @@ fn execute_native_payload_view(
                 .metrics
                 .delete_requests
                 .fetch_add(1, Ordering::Relaxed);
-            let removed = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .delete(namespace, key);
+            let removed = state.engine.delete(namespace, key);
             ResponsePayload::Deleted { removed }
         }
         RequestPayloadView::TagInvalidate { namespace, tag } => {
@@ -505,11 +498,7 @@ fn execute_native_payload_view(
                 .metrics
                 .tag_invalidate_requests
                 .fetch_add(1, Ordering::Relaxed);
-            let removed = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .invalidate_tag(namespace, tag);
+            let removed = state.engine.invalidate_tag(namespace, tag);
             ResponsePayload::Invalidated {
                 removed: removed.min(u32::MAX as usize) as u32,
             }
@@ -535,8 +524,6 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
             state.metrics.put_requests.fetch_add(1, Ordering::Relaxed);
             match state
                 .engine
-                .lock()
-                .expect("engine mutex poisoned")
                 .put(native_put_command(namespace, key, metadata, value))
             {
                 Ok(outcome) => ResponsePayload::Stored {
@@ -553,11 +540,7 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
                 .metrics
                 .delete_requests
                 .fetch_add(1, Ordering::Relaxed);
-            let removed = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .delete(&namespace, &key);
+            let removed = state.engine.delete(&namespace, &key);
             ResponsePayload::Deleted { removed }
         }
         RequestPayload::BatchGet { namespace, keys } => {
@@ -565,11 +548,7 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
                 .metrics
                 .batch_get_requests
                 .fetch_add(1, Ordering::Relaxed);
-            let outcomes = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .batch_get(&namespace, &keys);
+            let outcomes = state.engine.batch_get(&namespace, &keys);
             let mut items = Vec::with_capacity(outcomes.len());
             for outcome in outcomes {
                 match outcome {
@@ -594,11 +573,7 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
                 .metrics
                 .tag_invalidate_requests
                 .fetch_add(1, Ordering::Relaxed);
-            let removed = state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .invalidate_tag(&namespace, &tag);
+            let removed = state.engine.invalidate_tag(&namespace, &tag);
             ResponsePayload::Invalidated {
                 removed: removed.min(u32::MAX as usize) as u32,
             }
@@ -626,12 +601,7 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
                 tags: metadata.tags,
                 cost: metadata.cost,
             };
-            match state
-                .engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .complete_lease(command)
-            {
+            match state.engine.complete_lease(command) {
                 Ok(outcome) => ResponsePayload::Stored {
                     evicted: outcome.evicted.min(u32::MAX as usize) as u32,
                 },
@@ -653,12 +623,7 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
 
 fn execute_native_get(state: &AppState, namespace: &str, key: &[u8]) -> ResponsePayload {
     state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
-    match state
-        .engine
-        .lock()
-        .expect("engine mutex poisoned")
-        .get(namespace, key)
-    {
+    match state.engine.get(namespace, key) {
         GetOutcome::Hit(value) => {
             state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::Hit(value)
@@ -685,8 +650,6 @@ fn encode_native_get_response_frame(
     state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
     state
         .engine
-        .lock()
-        .expect("engine mutex poisoned")
         .get_ref(namespace, key, |outcome| match outcome {
             GetOutcomeRef::Hit(value) => {
                 state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
@@ -724,12 +687,7 @@ fn execute_native_lease_start(
     key: &[u8],
     lease_ttl_ms: u64,
 ) -> ResponsePayload {
-    match state
-        .engine
-        .lock()
-        .expect("engine mutex poisoned")
-        .start_lease(namespace, key, lease_ttl_ms)
-    {
+    match state.engine.start_lease(namespace, key, lease_ttl_ms) {
         StartLeaseOutcome::Hit(value) => {
             state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::Hit(value)
@@ -815,11 +773,10 @@ fn native_decode_error_code(error: &DecodeError) -> ErrorCode {
 
 fn metrics_response(state: &AppState) -> Response {
     let snapshot = state.metrics.snapshot();
-    let engine = state.engine.lock().expect("engine mutex poisoned");
-    let engine_stats = engine.stats();
-    let memory_used_bytes = engine.memory_used_bytes();
-    let cost_score_total = engine.cost_score_total();
-    let limits = engine.limits();
+    let engine_stats = state.engine.stats();
+    let memory_used_bytes = state.engine.memory_used_bytes();
+    let cost_score_total = state.engine.cost_score_total();
+    let limits = state.engine.limits();
 
     let body = format!(
         "\
@@ -1012,29 +969,26 @@ mod tests {
         let cleanup_task = spawn_expiration_worker(Arc::clone(&state.engine), 5, 1)
             .expect("cleanup task should start");
 
-        {
-            let mut engine = state.engine.lock().expect("engine mutex poisoned");
-            for key in [b"a", b"b", b"c"] {
-                engine
-                    .put(PutCommand {
-                        namespace: "default".to_string(),
-                        key: key.to_vec(),
-                        value: b"value".to_vec(),
-                        ttl: Some(crate::api::Ttl { milliseconds: 1 }),
-                        stale_ttl: None,
-                        tags: Vec::new(),
-                        cost: None,
-                    })
-                    .expect("value should fit");
-            }
+        for key in [b"a", b"b", b"c"] {
+            state
+                .engine
+                .put(PutCommand {
+                    namespace: "default".to_string(),
+                    key: key.to_vec(),
+                    value: b"value".to_vec(),
+                    ttl: Some(crate::api::Ttl { milliseconds: 1 }),
+                    stale_ttl: None,
+                    tags: Vec::new(),
+                    cost: None,
+                })
+                .expect("value should fit");
         }
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         cleanup_task.abort();
 
-        let engine = state.engine.lock().expect("engine mutex poisoned");
-        assert_eq!(engine.len(), 0);
-        assert_eq!(engine.stats().expirations, 3);
+        assert_eq!(state.engine.len(), 0);
+        assert_eq!(state.engine.stats().expirations, 3);
     }
 
     #[tokio::test]
