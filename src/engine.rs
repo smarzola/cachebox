@@ -122,6 +122,18 @@ where
             .get_ref(namespace, key, map)
     }
 
+    pub fn get_ref_without_access_update<R>(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        map: impl FnOnce(GetOutcomeRef<'_>) -> R,
+    ) -> R {
+        self.shard_for(namespace, key)
+            .lock()
+            .expect("engine shard mutex poisoned")
+            .get_ref_without_access_update(namespace, key, map)
+    }
+
     pub fn delete(&self, namespace: &str, key: &[u8]) -> bool {
         self.shard_for(namespace, key)
             .lock()
@@ -360,6 +372,25 @@ where
         key: &[u8],
         map: impl FnOnce(GetOutcomeRef<'_>) -> R,
     ) -> R {
+        self.get_ref_inner(namespace, key, true, map)
+    }
+
+    pub fn get_ref_without_access_update<R>(
+        &mut self,
+        namespace: &str,
+        key: &[u8],
+        map: impl FnOnce(GetOutcomeRef<'_>) -> R,
+    ) -> R {
+        self.get_ref_inner(namespace, key, false, map)
+    }
+
+    fn get_ref_inner<R>(
+        &mut self,
+        namespace: &str,
+        key: &[u8],
+        update_access: bool,
+        map: impl FnOnce(GetOutcomeRef<'_>) -> R,
+    ) -> R {
         let id = EntryId::new(namespace, key);
         let now_ms = self.clock.now_ms();
         let Some(entry) = self.entries.get_mut(&id) else {
@@ -372,15 +403,19 @@ where
                 map(GetOutcomeRef::Miss)
             }
             EntryState::Fresh => {
-                let access = self.next_access;
-                self.next_access = self.next_access.saturating_add(1);
-                entry.last_access = access;
+                if update_access {
+                    let access = self.next_access;
+                    self.next_access = self.next_access.saturating_add(1);
+                    entry.last_access = access;
+                }
                 map(GetOutcomeRef::Hit(&entry.value))
             }
             EntryState::Stale => {
-                let access = self.next_access;
-                self.next_access = self.next_access.saturating_add(1);
-                entry.last_access = access;
+                if update_access {
+                    let access = self.next_access;
+                    self.next_access = self.next_access.saturating_add(1);
+                    entry.last_access = access;
+                }
                 map(GetOutcomeRef::Stale(&entry.value))
             }
         }
@@ -1196,6 +1231,31 @@ mod tests {
             GetOutcome::Hit(b"3333333333".to_vec())
         );
         assert!(engine.memory_used_bytes() <= engine.limits().max_memory_bytes);
+    }
+
+    #[test]
+    fn get_ref_without_access_update_does_not_refresh_lru_state() {
+        let (mut engine, _) = tiny_engine(240, 1_000);
+        engine
+            .put(put("default", b"a", b"1111111111"))
+            .expect("a should fit");
+        engine
+            .put(put("default", b"b", b"2222222222"))
+            .expect("b should fit");
+        engine.get_ref_without_access_update("default", b"a", |outcome| {
+            assert!(matches!(outcome, GetOutcomeRef::Hit(b"1111111111")));
+        });
+
+        let outcome = engine
+            .put(put("default", b"c", b"3333333333"))
+            .expect("c should fit by evicting one entry");
+
+        assert_eq!(outcome.evicted, 1);
+        assert_eq!(engine.get("default", b"a"), GetOutcome::Miss);
+        assert_eq!(
+            engine.get("default", b"b"),
+            GetOutcome::Hit(b"2222222222".to_vec())
+        );
     }
 
     #[test]

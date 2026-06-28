@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use cachebox::api::Ttl;
 use cachebox::config::Config;
-use cachebox::engine::{Engine, GetOutcome, PutCommand};
+use cachebox::engine::{Engine, GetOutcome, GetOutcomeRef, PutCommand, ShardedEngine};
 use cachebox::protocol::{
     BatchItem, Command, HEADER_LEN, Metadata, RequestFrame, RequestPayload, ResponsePayload,
     ResponsePayloadView, decode_request_frame, decode_response_frame, encode_request_frame_into,
@@ -69,6 +69,8 @@ async fn async_main() {
         bench_protocol_decode_get(),
         bench_protocol_encode_hit(),
         bench_engine_get_ref_encode(),
+        bench_sharded_get_ref_encode(),
+        bench_sharded_get_ref_no_access_encode(),
         bench_tokio_spawn_ready().await,
         bench_tokio_spawn_mpsc_response().await,
         bench_native_single_key_get(&mut native_client).await,
@@ -277,6 +279,87 @@ fn bench_engine_get_ref_encode() -> BenchResult {
         },
     );
     with_memory(result, engine.memory_used_bytes())
+}
+
+fn bench_sharded_get_ref_encode() -> BenchResult {
+    let engine = ShardedEngine::with_limits(Default::default());
+    engine
+        .put(put_command("bench", b"sharded-get-ref-encode", b"value"))
+        .expect("engine put should fit");
+    let mut out = Vec::new();
+    warmup_sync(|| {
+        encode_sharded_get_ref_response(&engine, b"sharded-get-ref-encode", true, &mut out);
+    });
+    let result = measure_process_sync(
+        "sharded_get_ref_encode",
+        "shard_lock_get_ref_access_update_encode",
+        || {
+            encode_sharded_get_ref_response(&engine, b"sharded-get-ref-encode", true, &mut out);
+        },
+    );
+    with_memory(result, engine.memory_used_bytes())
+}
+
+fn bench_sharded_get_ref_no_access_encode() -> BenchResult {
+    let engine = ShardedEngine::with_limits(Default::default());
+    engine
+        .put(put_command(
+            "bench",
+            b"sharded-get-ref-no-access-encode",
+            b"value",
+        ))
+        .expect("engine put should fit");
+    let mut out = Vec::new();
+    warmup_sync(|| {
+        encode_sharded_get_ref_response(
+            &engine,
+            b"sharded-get-ref-no-access-encode",
+            false,
+            &mut out,
+        );
+    });
+    let result = measure_process_sync(
+        "sharded_get_ref_no_access_encode",
+        "shard_lock_get_ref_without_access_update_encode",
+        || {
+            encode_sharded_get_ref_response(
+                &engine,
+                b"sharded-get-ref-no-access-encode",
+                false,
+                &mut out,
+            );
+        },
+    );
+    with_memory(result, engine.memory_used_bytes())
+}
+
+fn encode_sharded_get_ref_response(
+    engine: &ShardedEngine,
+    key: &[u8],
+    update_access: bool,
+    out: &mut Vec<u8>,
+) {
+    if update_access {
+        engine.get_ref("bench", key, |outcome| match outcome {
+            GetOutcomeRef::Hit(value) => encode_response_payload_view_frame_into(
+                1,
+                Command::Get,
+                ResponsePayloadView::Hit(value),
+                out,
+            ),
+            other => panic!("expected hit, got {other:?}"),
+        });
+    } else {
+        engine.get_ref_without_access_update("bench", key, |outcome| match outcome {
+            GetOutcomeRef::Hit(value) => encode_response_payload_view_frame_into(
+                1,
+                Command::Get,
+                ResponsePayloadView::Hit(value),
+                out,
+            ),
+            other => panic!("expected hit, got {other:?}"),
+        });
+    }
 }
 
 async fn bench_tokio_spawn_ready() -> BenchResult {
