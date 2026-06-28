@@ -49,6 +49,46 @@ This loop continues the existing official-client branch and pull request. Do
 not open a replacement PR for this pivot unless the maintainer explicitly asks
 for a separate PR; update the current branch and PR as milestones land.
 
+## Current Consensus Decisions
+
+- The default Python client should be native Python, not Rust bindings. Rust
+  remains the protocol reference, server implementation, fixture authority, and
+  official Rust client, but the Python package should install and run without a
+  Rust toolchain.
+- Native Python is the better default for `asyncio`, gevent-monkey-patched
+  socket usage, source distributions, universal wheels, and future TypeScript
+  parity. Since a TypeScript client will need to reimplement the protocol
+  anyway, protocol fixtures and conformance tests are the right shared
+  foundation across clients.
+- The low-level Python layer must be a complete driver, but the public client
+  should not stop at driver primitives. The expected Python user experience is
+  an opinionated caching library with decorators, serialization, key building,
+  invalidation helpers, stale behavior, and dogpile protection.
+- Optional connection pooling is first-class for both sync and async clients.
+  A single client connection may remain the simplest default, but applications
+  with concurrent threads, greenlets, coroutines, or repeated short operations
+  need a documented pool with max size, acquisition timeout, close behavior,
+  error handling, and cancellation behavior for async callers.
+- Do not expose a public Python pipelining API in the first native-client
+  release. Pipelining adds ordering, request matching, partial failure,
+  timeout, cancellation, backpressure, reconnect, and gevent interaction
+  questions that are not required for a strong caching-library surface.
+- Keep protocol and driver internals compatible with future request ID
+  matching. Revisit pipelining only after batching, pooling, decorators,
+  serialization, dogpile protection, and async support are stable.
+- Dogpile protection is foundational, not a nice-to-have. High-level
+  `get_or_set` and decorator flows should use Cachebox leases so concurrent
+  misses do not stampede the origin, and lease denial should lead to waiting,
+  stale return, or another documented policy rather than duplicate recompute by
+  default.
+- Stale behavior must be explicit. The high-level API should distinguish
+  normal hits, stale reads, lease-granted refreshes, lease-denied waits,
+  wrapped-function failures, serialization failures, connection failures, and
+  server errors.
+- Keep working on the existing `feat/official-client-foundation` branch and
+  existing official-client pull request. Do not create a new branch or PR for
+  this pivot unless the maintainer explicitly requests it.
+
 ## Design Principles
 
 - Prefer runtime-native clients for language ecosystem fit.
