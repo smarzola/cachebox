@@ -4,6 +4,7 @@ This package is intentionally pure Python by default.
 """
 
 from . import protocol
+from .async_client import AsyncClient, AsyncClientPool
 from .client import (
     Client,
     ClientError,
@@ -18,6 +19,8 @@ __version__ = "0.1.0"
 __all__ = [
     "__version__",
     "protocol",
+    "AsyncClient",
+    "AsyncClientPool",
     "Client",
     "ClientError",
     "ClientPool",
