@@ -136,8 +136,9 @@ The admin HTTP endpoint emits Prometheus-style metrics:
 - Memory used and memory limit.
 - Current aggregate cost score.
 
-Scraping `/metrics` is observational. It does not reclaim expired entries and
-does not increment request counters.
+Hot operation counters are striped across multiple atomic counter groups and
+summed during metrics scrape. Scraping `/metrics` is observational. It does not
+reclaim expired entries and does not increment request counters.
 
 Startup and Ctrl-C shutdown logs are key-value text. Per-connection tracking is
 not wired yet, so the connection gauge is exposed as zero until a connection

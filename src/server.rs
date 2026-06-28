@@ -35,6 +35,8 @@ use crate::protocol::{
 };
 
 const MAX_IN_FLIGHT_PER_CONNECTION: usize = 128;
+const METRIC_SHARD_COUNT: usize = 64;
+static NEXT_NATIVE_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct StartupReport {
@@ -66,8 +68,40 @@ impl AppState {
     }
 }
 
-#[derive(Debug, Default)]
 struct Metrics {
+    shards: Vec<MetricsShard>,
+}
+
+impl Metrics {
+    fn shard_for_request(&self, connection_id: u64, request_id: u64) -> &MetricsShard {
+        let mixed = connection_id ^ request_id.rotate_left(17);
+        &self.shards[(mixed as usize) % self.shards.len()]
+    }
+
+    fn admin_shard(&self) -> &MetricsShard {
+        &self.shards[0]
+    }
+
+    fn snapshot(&self) -> MetricsSnapshot {
+        self.shards
+            .iter()
+            .map(MetricsShard::snapshot)
+            .fold(MetricsSnapshot::default(), MetricsSnapshot::saturating_add)
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            shards: (0..METRIC_SHARD_COUNT)
+                .map(|_| MetricsShard::default())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetricsShard {
     requests_total: AtomicU64,
     health_requests: AtomicU64,
     get_requests: AtomicU64,
@@ -83,7 +117,7 @@ struct Metrics {
     errors_total: AtomicU64,
 }
 
-impl Metrics {
+impl MetricsShard {
     fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             requests_total: self.requests_total.load(Ordering::Relaxed),
@@ -103,7 +137,7 @@ impl Metrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MetricsSnapshot {
     requests_total: u64,
     health_requests: u64,
@@ -118,6 +152,29 @@ struct MetricsSnapshot {
     lease_grants: u64,
     lease_denials: u64,
     errors_total: u64,
+}
+
+impl MetricsSnapshot {
+    fn saturating_add(mut self, other: Self) -> Self {
+        self.requests_total = self.requests_total.saturating_add(other.requests_total);
+        self.health_requests = self.health_requests.saturating_add(other.health_requests);
+        self.get_requests = self.get_requests.saturating_add(other.get_requests);
+        self.put_requests = self.put_requests.saturating_add(other.put_requests);
+        self.delete_requests = self.delete_requests.saturating_add(other.delete_requests);
+        self.batch_get_requests = self
+            .batch_get_requests
+            .saturating_add(other.batch_get_requests);
+        self.tag_invalidate_requests = self
+            .tag_invalidate_requests
+            .saturating_add(other.tag_invalidate_requests);
+        self.hits_total = self.hits_total.saturating_add(other.hits_total);
+        self.misses_total = self.misses_total.saturating_add(other.misses_total);
+        self.stale_total = self.stale_total.saturating_add(other.stale_total);
+        self.lease_grants = self.lease_grants.saturating_add(other.lease_grants);
+        self.lease_denials = self.lease_denials.saturating_add(other.lease_denials);
+        self.errors_total = self.errors_total.saturating_add(other.errors_total);
+        self
+    }
 }
 
 pub fn startup_report(config: &Config) -> StartupReport {
@@ -339,6 +396,7 @@ async fn handle_native_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let connection_id = NEXT_NATIVE_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (response_tx, mut response_rx) = mpsc::channel::<Vec<u8>>(MAX_IN_FLIGHT_PER_CONNECTION);
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONNECTION));
@@ -358,7 +416,8 @@ where
         let state = state.clone();
         let response_tx = response_tx.clone();
         tokio::spawn(async move {
-            let response = execute_native_frame_bytes(&state, &frame, max_payload_len);
+            let response =
+                execute_native_frame_bytes(&state, &frame, max_payload_len, connection_id);
             let _ = response_tx.send(response).await;
             drop(permit);
         });
@@ -397,13 +456,22 @@ where
     Ok(Some(frame))
 }
 
-fn execute_native_frame_bytes(state: &AppState, frame: &[u8], max_payload_len: usize) -> Vec<u8> {
+fn execute_native_frame_bytes(
+    state: &AppState,
+    frame: &[u8],
+    max_payload_len: usize,
+    connection_id: u64,
+) -> Vec<u8> {
     let mut response_buffer = Vec::new();
     match decode_borrowed_request_frame(frame, max_payload_len) {
         Ok(Some(request)) => {
+            let metrics = state
+                .metrics
+                .shard_for_request(connection_id, request.request_id);
             if let RequestPayloadView::Get { namespace, key } = request.payload {
                 encode_native_get_response_frame(
                     state,
+                    metrics,
                     request.request_id,
                     request.command,
                     namespace,
@@ -411,13 +479,16 @@ fn execute_native_frame_bytes(state: &AppState, frame: &[u8], max_payload_len: u
                     &mut response_buffer,
                 );
             } else {
-                let response = execute_native_request_view(state, request);
+                let response = execute_native_request_view(state, metrics, request);
                 encode_response_frame_into(&response, &mut response_buffer);
             }
         }
         Ok(None) => match decode_request_frame(frame, max_payload_len) {
             Ok(request) => {
-                let response = execute_native_request(state, request);
+                let metrics = state
+                    .metrics
+                    .shard_for_request(connection_id, request.request_id);
+                let response = execute_native_request(state, metrics, request);
                 encode_response_frame_into(&response, &mut response_buffer);
             }
             Err(error) => {
@@ -446,16 +517,15 @@ async fn handle_request(
     }
 
     if method == HttpMethod::GET && path == crate::api::HEALTH_ROUTE {
-        state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-        state
-            .metrics
-            .health_requests
-            .fetch_add(1, Ordering::Relaxed);
+        let metrics = state.metrics.admin_shard();
+        metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        metrics.health_requests.fetch_add(1, Ordering::Relaxed);
         return (HttpStatusCode::OK, "ok").into_response();
     }
 
-    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+    let metrics = state.metrics.admin_shard();
+    metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    metrics.errors_total.fetch_add(1, Ordering::Relaxed);
     (
         HttpStatusCode::NOT_FOUND,
         "HTTP is admin-only; use the native socket protocol for cache operations",
@@ -463,39 +533,46 @@ async fn handle_request(
         .into_response()
 }
 
-fn execute_native_request(state: &AppState, frame: RequestFrame) -> ResponseFrame {
+fn execute_native_request(
+    state: &AppState,
+    metrics: &MetricsShard,
+    frame: RequestFrame,
+) -> ResponseFrame {
     ResponseFrame {
         request_id: frame.request_id,
         command: frame.command,
-        payload: execute_native_payload(state, frame.payload),
+        payload: execute_native_payload_with_metrics(state, metrics, frame.payload),
     }
 }
 
-fn execute_native_request_view(state: &AppState, frame: RequestFrameView<'_>) -> ResponseFrame {
+fn execute_native_request_view(
+    state: &AppState,
+    metrics: &MetricsShard,
+    frame: RequestFrameView<'_>,
+) -> ResponseFrame {
     ResponseFrame {
         request_id: frame.request_id,
         command: frame.command,
-        payload: execute_native_payload_view(state, frame.payload),
+        payload: execute_native_payload_view(state, metrics, frame.payload),
     }
 }
 
 fn execute_native_payload_view(
     state: &AppState,
+    metrics: &MetricsShard,
     payload: RequestPayloadView<'_>,
 ) -> ResponsePayload {
     match payload {
-        RequestPayloadView::Get { namespace, key } => execute_native_get(state, namespace, key),
+        RequestPayloadView::Get { namespace, key } => {
+            execute_native_get(state, metrics, namespace, key)
+        }
         RequestPayloadView::Delete { namespace, key } => {
-            state
-                .metrics
-                .delete_requests
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.delete_requests.fetch_add(1, Ordering::Relaxed);
             let removed = state.engine.delete(namespace, key);
             ResponsePayload::Deleted { removed }
         }
         RequestPayloadView::TagInvalidate { namespace, tag } => {
-            state
-                .metrics
+            metrics
                 .tag_invalidate_requests
                 .fetch_add(1, Ordering::Relaxed);
             let removed = state.engine.invalidate_tag(namespace, tag);
@@ -508,20 +585,32 @@ fn execute_native_payload_view(
             key,
             lease_ttl_ms,
             allow_stale_ms: _,
-        } => execute_native_lease_start(state, namespace, key, lease_ttl_ms),
+        } => execute_native_lease_start(state, metrics, namespace, key, lease_ttl_ms),
     }
 }
 
+#[cfg(test)]
 fn execute_native_payload(state: &AppState, payload: RequestPayload) -> ResponsePayload {
+    let metrics = state.metrics.admin_shard();
+    execute_native_payload_with_metrics(state, metrics, payload)
+}
+
+fn execute_native_payload_with_metrics(
+    state: &AppState,
+    metrics: &MetricsShard,
+    payload: RequestPayload,
+) -> ResponsePayload {
     match payload {
-        RequestPayload::Get { namespace, key } => execute_native_get(state, &namespace, &key),
+        RequestPayload::Get { namespace, key } => {
+            execute_native_get(state, metrics, &namespace, &key)
+        }
         RequestPayload::Put {
             namespace,
             key,
             metadata,
             value,
         } => {
-            state.metrics.put_requests.fetch_add(1, Ordering::Relaxed);
+            metrics.put_requests.fetch_add(1, Ordering::Relaxed);
             match state
                 .engine
                 .put(native_put_command(namespace, key, metadata, value))
@@ -530,38 +619,32 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
                     evicted: outcome.evicted.min(u32::MAX as usize) as u32,
                 },
                 Err(error) => {
-                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.errors_total.fetch_add(1, Ordering::Relaxed);
                     native_put_error(error)
                 }
             }
         }
         RequestPayload::Delete { namespace, key } => {
-            state
-                .metrics
-                .delete_requests
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.delete_requests.fetch_add(1, Ordering::Relaxed);
             let removed = state.engine.delete(&namespace, &key);
             ResponsePayload::Deleted { removed }
         }
         RequestPayload::BatchGet { namespace, keys } => {
-            state
-                .metrics
-                .batch_get_requests
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.batch_get_requests.fetch_add(1, Ordering::Relaxed);
             let outcomes = state.engine.batch_get(&namespace, &keys);
             let mut items = Vec::with_capacity(outcomes.len());
             for outcome in outcomes {
                 match outcome {
                     GetOutcome::Hit(value) => {
-                        state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+                        metrics.hits_total.fetch_add(1, Ordering::Relaxed);
                         items.push(BatchItem::Hit(value));
                     }
                     GetOutcome::Stale(value) => {
-                        state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+                        metrics.stale_total.fetch_add(1, Ordering::Relaxed);
                         items.push(BatchItem::Stale(value));
                     }
                     GetOutcome::Miss => {
-                        state.metrics.misses_total.fetch_add(1, Ordering::Relaxed);
+                        metrics.misses_total.fetch_add(1, Ordering::Relaxed);
                         items.push(BatchItem::Miss);
                     }
                 }
@@ -569,8 +652,7 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
             ResponsePayload::BatchGet { items }
         }
         RequestPayload::TagInvalidate { namespace, tag } => {
-            state
-                .metrics
+            metrics
                 .tag_invalidate_requests
                 .fetch_add(1, Ordering::Relaxed);
             let removed = state.engine.invalidate_tag(&namespace, &tag);
@@ -583,7 +665,7 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
             key,
             lease_ttl_ms,
             allow_stale_ms: _,
-        } => execute_native_lease_start(state, &namespace, &key, lease_ttl_ms),
+        } => execute_native_lease_start(state, metrics, &namespace, &key, lease_ttl_ms),
         RequestPayload::LeaseComplete {
             namespace,
             key,
@@ -606,14 +688,14 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
                     evicted: outcome.evicted.min(u32::MAX as usize) as u32,
                 },
                 Err(CompleteLeaseError::InvalidLeaseToken) => {
-                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.errors_total.fetch_add(1, Ordering::Relaxed);
                     ResponsePayload::Error {
                         code: ErrorCode::InvalidLeaseToken,
                         message: "lease token is missing, expired, or no longer active".to_string(),
                     }
                 }
                 Err(CompleteLeaseError::Put(error)) => {
-                    state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.errors_total.fetch_add(1, Ordering::Relaxed);
                     native_put_error(error)
                 }
             }
@@ -621,19 +703,24 @@ fn execute_native_payload(state: &AppState, payload: RequestPayload) -> Response
     }
 }
 
-fn execute_native_get(state: &AppState, namespace: &str, key: &[u8]) -> ResponsePayload {
-    state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
+fn execute_native_get(
+    state: &AppState,
+    metrics: &MetricsShard,
+    namespace: &str,
+    key: &[u8],
+) -> ResponsePayload {
+    metrics.get_requests.fetch_add(1, Ordering::Relaxed);
     match state.engine.get(namespace, key) {
         GetOutcome::Hit(value) => {
-            state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+            metrics.hits_total.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::Hit(value)
         }
         GetOutcome::Stale(value) => {
-            state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+            metrics.stale_total.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::Stale(value)
         }
         GetOutcome::Miss => {
-            state.metrics.misses_total.fetch_add(1, Ordering::Relaxed);
+            metrics.misses_total.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::Miss
         }
     }
@@ -641,18 +728,19 @@ fn execute_native_get(state: &AppState, namespace: &str, key: &[u8]) -> Response
 
 fn encode_native_get_response_frame(
     state: &AppState,
+    metrics: &MetricsShard,
     request_id: u64,
     command: Command,
     namespace: &str,
     key: &[u8],
     out: &mut Vec<u8>,
 ) {
-    state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
+    metrics.get_requests.fetch_add(1, Ordering::Relaxed);
     state
         .engine
         .get_ref(namespace, key, |outcome| match outcome {
             GetOutcomeRef::Hit(value) => {
-                state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+                metrics.hits_total.fetch_add(1, Ordering::Relaxed);
                 encode_response_payload_view_frame_into(
                     request_id,
                     command,
@@ -661,7 +749,7 @@ fn encode_native_get_response_frame(
                 );
             }
             GetOutcomeRef::Stale(value) => {
-                state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+                metrics.stale_total.fetch_add(1, Ordering::Relaxed);
                 encode_response_payload_view_frame_into(
                     request_id,
                     command,
@@ -670,7 +758,7 @@ fn encode_native_get_response_frame(
                 );
             }
             GetOutcomeRef::Miss => {
-                state.metrics.misses_total.fetch_add(1, Ordering::Relaxed);
+                metrics.misses_total.fetch_add(1, Ordering::Relaxed);
                 encode_response_payload_view_frame_into(
                     request_id,
                     command,
@@ -683,28 +771,29 @@ fn encode_native_get_response_frame(
 
 fn execute_native_lease_start(
     state: &AppState,
+    metrics: &MetricsShard,
     namespace: &str,
     key: &[u8],
     lease_ttl_ms: u64,
 ) -> ResponsePayload {
     match state.engine.start_lease(namespace, key, lease_ttl_ms) {
         StartLeaseOutcome::Hit(value) => {
-            state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+            metrics.hits_total.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::Hit(value)
         }
         StartLeaseOutcome::Stale { value } => {
-            state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+            metrics.stale_total.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::Stale(value)
         }
         StartLeaseOutcome::LeaseGranted { token, stale_value } => {
-            state.metrics.lease_grants.fetch_add(1, Ordering::Relaxed);
+            metrics.lease_grants.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::LeaseGranted {
                 lease_token: token,
                 stale_value,
             }
         }
         StartLeaseOutcome::LeaseDenied => {
-            state.metrics.lease_denials.fetch_add(1, Ordering::Relaxed);
+            metrics.lease_denials.fetch_add(1, Ordering::Relaxed);
             ResponsePayload::LeaseDenied
         }
     }
@@ -989,6 +1078,28 @@ mod tests {
 
         assert_eq!(state.engine.len(), 0);
         assert_eq!(state.engine.stats().expirations, 3);
+    }
+
+    #[test]
+    fn metrics_snapshot_aggregates_request_shards() {
+        let metrics = Metrics::default();
+        metrics
+            .shard_for_request(1, 1)
+            .get_requests
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .shard_for_request(2, 1)
+            .hits_total
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .admin_shard()
+            .requests_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.requests_total, 1);
+        assert_eq!(snapshot.get_requests, 1);
+        assert_eq!(snapshot.hits_total, 1);
     }
 
     #[tokio::test]
