@@ -21,6 +21,7 @@ the top-level `docs/` files are the user-facing documentation.
 - [Performance phase 2 adaptive execution](performance-phase-2-adaptive-execution.md)
 - [Performance phase 2 buffer reuse](performance-phase-2-buffer-reuse.md)
 - [Performance phase 2 access accounting](performance-phase-2-access-accounting.md)
+- [Performance phase 2 tag routing](performance-phase-2-tag-routing.md)
 - [Performance uplift goal loop](performance-uplift-goal-loop.md)
 - [Performance uplift metrics](performance-uplift-metrics.md)
 - [Performance uplift pipelining](performance-uplift-pipelining.md)

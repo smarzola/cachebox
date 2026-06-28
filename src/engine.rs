@@ -71,6 +71,7 @@ where
     C: Clock,
 {
     shards: Vec<Mutex<Engine<C>>>,
+    tag_directory: Mutex<HashMap<TagId, HashSet<usize>>>,
     limits: EngineLimits,
 }
 
@@ -93,14 +94,32 @@ where
         let shards = (0..shard_count)
             .map(|_| Mutex::new(Engine::with_clock_and_limits(clock.clone(), shard_limits)))
             .collect();
-        Self { shards, limits }
+        Self {
+            shards,
+            tag_directory: Mutex::new(HashMap::new()),
+            limits,
+        }
     }
 
     pub fn put(&self, command: PutCommand) -> Result<PutOutcome, PutError> {
-        self.shard_for(&command.namespace, &command.key)
+        let namespace = command.namespace.clone();
+        let key = command.key.clone();
+        let new_tags = tag_ids(&namespace, &command.tags);
+        let shard_index = self.shard_index_for(&namespace, &key);
+        let mut shard = self.shards[shard_index]
             .lock()
-            .expect("engine shard mutex poisoned")
-            .put(command)
+            .expect("engine shard mutex poisoned");
+        let old_tags = shard.tag_ids_for_entry(&namespace, &key);
+        let result = shard.put(command);
+        let old_tags_without_entries = old_tags
+            .into_iter()
+            .filter(|tag_id| !shard.has_tag_id(tag_id))
+            .collect::<Vec<_>>();
+        drop(shard);
+
+        let add_tags = if result.is_ok() { new_tags } else { Vec::new() };
+        self.update_tag_routes(shard_index, add_tags, old_tags_without_entries);
+        result
     }
 
     pub fn get(&self, namespace: &str, key: &[u8]) -> GetOutcome {
@@ -135,10 +154,22 @@ where
     }
 
     pub fn delete(&self, namespace: &str, key: &[u8]) -> bool {
-        self.shard_for(namespace, key)
+        let shard_index = self.shard_index_for(namespace, key);
+        let mut shard = self.shards[shard_index]
             .lock()
-            .expect("engine shard mutex poisoned")
-            .delete(namespace, key)
+            .expect("engine shard mutex poisoned");
+        let old_tags = shard.tag_ids_for_entry(namespace, key);
+        let removed = shard.delete(namespace, key);
+        let old_tags_without_entries = old_tags
+            .into_iter()
+            .filter(|tag_id| !shard.has_tag_id(tag_id))
+            .collect::<Vec<_>>();
+        drop(shard);
+
+        if removed {
+            self.update_tag_routes(shard_index, Vec::new(), old_tags_without_entries);
+        }
+        removed
     }
 
     pub fn batch_get(&self, namespace: &str, keys: &[Vec<u8>]) -> Vec<GetOutcome> {
@@ -146,10 +177,22 @@ where
     }
 
     pub fn invalidate_tag(&self, namespace: &str, tag: &str) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| {
-                shard
+        let tag_id = TagId {
+            namespace: namespace.to_string(),
+            tag: tag.to_string(),
+        };
+        let shard_indices = self
+            .tag_directory
+            .lock()
+            .expect("tag directory mutex poisoned")
+            .remove(&tag_id)
+            .map(|indices| indices.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        shard_indices
+            .into_iter()
+            .map(|index| {
+                self.shards[index]
                     .lock()
                     .expect("engine shard mutex poisoned")
                     .invalidate_tag(namespace, tag)
@@ -168,10 +211,24 @@ where
         &self,
         command: CompleteLeaseCommand,
     ) -> Result<PutOutcome, CompleteLeaseError> {
-        self.shard_for(&command.namespace, &command.key)
+        let namespace = command.namespace.clone();
+        let key = command.key.clone();
+        let new_tags = tag_ids(&namespace, &command.tags);
+        let shard_index = self.shard_index_for(&namespace, &key);
+        let mut shard = self.shards[shard_index]
             .lock()
-            .expect("engine shard mutex poisoned")
-            .complete_lease(command)
+            .expect("engine shard mutex poisoned");
+        let old_tags = shard.tag_ids_for_entry(&namespace, &key);
+        let result = shard.complete_lease(command);
+        let old_tags_without_entries = old_tags
+            .into_iter()
+            .filter(|tag_id| !shard.has_tag_id(tag_id))
+            .collect::<Vec<_>>();
+        drop(shard);
+
+        let add_tags = if result.is_ok() { new_tags } else { Vec::new() };
+        self.update_tag_routes(shard_index, add_tags, old_tags_without_entries);
+        result
     }
 
     pub fn len(&self) -> usize {
@@ -245,10 +302,49 @@ where
     }
 
     fn shard_for(&self, namespace: &str, key: &[u8]) -> &Mutex<Engine<C>> {
+        &self.shards[self.shard_index_for(namespace, key)]
+    }
+
+    fn shard_index_for(&self, namespace: &str, key: &[u8]) -> usize {
         let mut hasher = DefaultHasher::new();
         namespace.hash(&mut hasher);
         key.hash(&mut hasher);
-        &self.shards[(hasher.finish() as usize) % self.shards.len()]
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn update_tag_routes(&self, shard_index: usize, add_tags: Vec<TagId>, remove_tags: Vec<TagId>) {
+        if add_tags.is_empty() && remove_tags.is_empty() {
+            return;
+        }
+        let mut directory = self
+            .tag_directory
+            .lock()
+            .expect("tag directory mutex poisoned");
+        for tag_id in remove_tags {
+            if let Some(indices) = directory.get_mut(&tag_id) {
+                indices.remove(&shard_index);
+                if indices.is_empty() {
+                    directory.remove(&tag_id);
+                }
+            }
+        }
+        for tag_id in add_tags {
+            directory.entry(tag_id).or_default().insert(shard_index);
+        }
+    }
+
+    #[cfg(test)]
+    fn routed_shard_count_for_tag(&self, namespace: &str, tag: &str) -> usize {
+        let tag_id = TagId {
+            namespace: namespace.to_string(),
+            tag: tag.to_string(),
+        };
+        self.tag_directory
+            .lock()
+            .expect("tag directory mutex poisoned")
+            .get(&tag_id)
+            .map(HashSet::len)
+            .unwrap_or(0)
     }
 }
 
@@ -447,6 +543,20 @@ where
             }
         }
         removed
+    }
+
+    fn tag_ids_for_entry(&self, namespace: &str, key: &[u8]) -> Vec<TagId> {
+        let id = EntryId::new(namespace, key);
+        self.entries
+            .get(&id)
+            .map(|entry| tag_ids(namespace, &entry.tags))
+            .unwrap_or_default()
+    }
+
+    fn has_tag_id(&self, tag_id: &TagId) -> bool {
+        self.tag_index
+            .get(tag_id)
+            .is_some_and(|ids| !ids.is_empty())
     }
 
     pub fn start_lease(
@@ -851,6 +961,15 @@ fn estimate_entry_memory(id: &EntryId, value: &[u8], tags: &[String]) -> usize {
         .saturating_add(tags.iter().map(String::len).sum::<usize>())
 }
 
+fn tag_ids(namespace: &str, tags: &[String]) -> Vec<TagId> {
+    tags.iter()
+        .map(|tag| TagId {
+            namespace: namespace.to_string(),
+            tag: tag.clone(),
+        })
+        .collect()
+}
+
 fn removable_at_ms(expires_at_ms: Option<u64>, stale_until_ms: Option<u64>) -> Option<u64> {
     stale_until_ms.or(expires_at_ms)
 }
@@ -953,7 +1072,10 @@ mod tests {
         }
 
         assert_eq!(engine.len(), 64);
+        assert!(engine.routed_shard_count_for_tag("default", "group") > 1);
+        assert!(engine.routed_shard_count_for_tag("default", "group") <= 8);
         assert_eq!(engine.invalidate_tag("default", "group"), 64);
+        assert_eq!(engine.routed_shard_count_for_tag("default", "group"), 0);
         assert_eq!(engine.len(), 0);
         for index in 0..64 {
             assert_eq!(
@@ -961,6 +1083,60 @@ mod tests {
                 GetOutcome::Miss
             );
         }
+    }
+
+    #[test]
+    fn sharded_tag_routing_cleans_replaced_tags() {
+        let (engine, _) = sharded_engine(8);
+        let mut first = put("default", b"k", b"old");
+        first.tags = vec!["old".to_string()];
+        engine.put(first).expect("put should fit");
+        assert_eq!(engine.routed_shard_count_for_tag("default", "old"), 1);
+
+        let mut second = put("default", b"k", b"new");
+        second.tags = vec!["new".to_string()];
+        engine.put(second).expect("put should fit");
+
+        assert_eq!(engine.routed_shard_count_for_tag("default", "old"), 0);
+        assert_eq!(engine.invalidate_tag("default", "old"), 0);
+        assert_eq!(
+            engine.get("default", b"k"),
+            GetOutcome::Hit(b"new".to_vec())
+        );
+        assert_eq!(engine.routed_shard_count_for_tag("default", "new"), 1);
+        assert_eq!(engine.invalidate_tag("default", "new"), 1);
+        assert_eq!(engine.get("default", b"k"), GetOutcome::Miss);
+    }
+
+    #[test]
+    fn sharded_tag_routing_cleans_deleted_entries() {
+        let (engine, _) = sharded_engine(8);
+        let mut command = put("default", b"k", b"value");
+        command.tags = vec!["group".to_string()];
+        engine.put(command).expect("put should fit");
+        assert_eq!(engine.routed_shard_count_for_tag("default", "group"), 1);
+
+        assert!(engine.delete("default", b"k"));
+
+        assert_eq!(engine.routed_shard_count_for_tag("default", "group"), 0);
+        assert_eq!(engine.invalidate_tag("default", "group"), 0);
+    }
+
+    #[test]
+    fn sharded_tag_routing_preserves_namespace_isolation() {
+        let (engine, _) = sharded_engine(8);
+        let mut first = put("default", b"a", b"1");
+        first.tags = vec!["org:9".to_string()];
+        engine.put(first).expect("put should fit");
+
+        let mut second = put("other", b"a", b"2");
+        second.tags = vec!["org:9".to_string()];
+        engine.put(second).expect("put should fit");
+
+        assert_eq!(engine.invalidate_tag("default", "org:9"), 1);
+        assert_eq!(engine.get("default", b"a"), GetOutcome::Miss);
+        assert_eq!(engine.get("other", b"a"), GetOutcome::Hit(b"2".to_vec()));
+        assert_eq!(engine.invalidate_tag("other", "org:9"), 1);
     }
 
     #[test]
