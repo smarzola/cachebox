@@ -7,7 +7,9 @@ packages.
 
 Status note: this document intentionally describes the pre-extraction boundary
 state. Milestone 2 begins moving protocol code into `crates/cachebox-protocol`;
-use the current source tree as authoritative for post-extraction paths.
+Milestone 3 begins moving the Rust client into
+`clients/rust/cachebox-client`; use the current source tree as authoritative
+for post-extraction paths.
 
 ## Target Behavior
 

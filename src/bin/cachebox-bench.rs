@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cachebox::client::NativeClient as OfficialNativeClient;
 use cachebox::config::Config;
 use cachebox::engine::{Engine, GetOutcome, GetOutcomeRef, PutCommand, ShardedEngine};
 use cachebox::protocol::{
@@ -13,6 +12,7 @@ use cachebox::protocol::{
     encode_request_frame_into, encode_response_payload_view_frame_into,
 };
 use cachebox::server;
+use cachebox_client::NativeClient as OfficialNativeClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 #[cfg(unix)]

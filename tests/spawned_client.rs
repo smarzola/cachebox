@@ -7,11 +7,11 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cachebox::client::{ClientError, NativeClient};
 use cachebox::protocol::{
     BatchItem, Command as NativeCommand, ContentType, Metadata, RequestPayload, ResponsePayload,
     Ttl,
 };
+use cachebox_client::{ClientError, NativeClient};
 
 struct ServerProcess {
     child: Child,

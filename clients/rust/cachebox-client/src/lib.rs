@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::{TcpStream, ToSocketAddrs};
 
-use crate::protocol::{
+use cachebox_protocol::{
     BatchItem, Command, DecodeError, ErrorCode, HEADER_LEN, Metadata, RequestFrame, RequestPayload,
     ResponseFrame, ResponsePayload, decode_response_frame, encode_request_frame_into,
 };

@@ -37,8 +37,8 @@ This example uses the native client API over a Unix socket. Use
 `NativeClient::connect_tcp("127.0.0.1:7401")` for TCP.
 
 ```rust
-use cachebox::client::NativeClient;
 use cachebox::protocol::{BatchItem, Metadata, ResponsePayload, Ttl};
+use cachebox_client::NativeClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

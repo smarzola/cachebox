@@ -1,0 +1,11 @@
+[package]
+name = "cachebox-client"
+version = "0.1.0"
+edition = "2024"
+description = "Official Rust client for Cachebox."
+license = "MIT"
+repository = "https://github.com/smarzola/cachebox"
+
+[dependencies]
+cachebox-protocol = { path = "../../../crates/cachebox-protocol" }
+tokio = { version = "1.52.3", features = ["io-util", "net"] }

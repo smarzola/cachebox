@@ -11,8 +11,8 @@ get from each feature.
 All Rust examples use:
 
 ```rust
-use cachebox::client::NativeClient;
 use cachebox::protocol::{BatchItem, Command, Metadata, RequestPayload, ResponsePayload, Ttl};
+use cachebox_client::NativeClient;
 ```
 
 Connect over TCP:
@@ -368,7 +368,7 @@ The native client returns structured server errors as `ClientError::Server`:
 
 ```rust
 match client.get("bad namespace!", b"k".to_vec()).await {
-    Err(cachebox::client::ClientError::Server { code, message }) => {
+    Err(cachebox_client::ClientError::Server { code, message }) => {
         let _ = (code, message);
     }
     other => panic!("unexpected result: {other:?}"),
