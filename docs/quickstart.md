@@ -1,47 +1,36 @@
 # Quickstart
 
-## Build
+This guide gets one Cachebox server running locally and stores a raw byte value
+through the native Rust client.
+
+## Build And Run
+
+Build the binary:
 
 ```sh
 cargo build
 ```
 
-## Run
+Start Cachebox with default listeners:
 
 ```sh
 cargo run --bin cachebox
 ```
 
-Default listeners:
+The default process opens two local surfaces:
 
 ```text
 admin HTTP: 127.0.0.1:7400
 native TCP: 127.0.0.1:7401
 ```
 
-Useful startup options:
+Use the native TCP listener for cache operations. Use the admin HTTP listener
+for health and metrics only.
 
-```sh
-cargo run --bin cachebox -- \
-  --bind 127.0.0.1:7400 \
-  --native-bind 127.0.0.1:7401 \
-  --native-unix /tmp/cachebox.sock \
-  --max-body-bytes 8388608 \
-  --max-memory-bytes 67108864 \
-  --max-value-bytes 8388608 \
-  --cleanup-interval-ms 250 \
-  --cleanup-max-entries-per-tick 128
-```
+## First Cache Entry
 
-Show all options:
-
-```sh
-cargo run --bin cachebox -- --help
-```
-
-## Store, Read, And Delete
-
-Use the native Rust client over TCP:
+This example stores `cached bytes` under a byte key. It gives the entry a fresh
+TTL, a stale window, two tags, and an optional cost score.
 
 ```rust
 use cachebox::api::Ttl;
@@ -55,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client
         .put(
             "default",
-            b"user:123".to_vec(),
+            b"user:123/profile".to_vec(),
             Metadata {
                 ttl: Some(Ttl {
                     milliseconds: 300_000,
@@ -71,40 +60,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let value = client.get("default", b"user:123".to_vec()).await?;
+    let value = client.get("default", b"user:123/profile".to_vec()).await?;
     assert_eq!(value, ResponsePayload::Hit(b"cached bytes".to_vec()));
 
-    assert!(client.delete("default", b"user:123".to_vec()).await?);
+    let removed = client.invalidate_tag("default", "user:123").await?;
+    assert_eq!(removed, 1);
+
+    let value = client.get("default", b"user:123/profile".to_vec()).await?;
+    assert_eq!(value, ResponsePayload::Miss);
 
     Ok(())
 }
 ```
 
-Use a Unix socket instead:
+The important pieces:
+
+- Namespace `default` keeps this key separate from other tenants or feature
+  areas.
+- The key is bytes, so it can contain any application-owned encoding.
+- TTL controls the fresh lifetime.
+- Stale TTL lets clients serve stale bytes while another client refreshes.
+- Tags let you invalidate a group without knowing every key.
+- Cost is recorded for metrics and future policy decisions; it does not change
+  eviction behavior today.
+
+## Unix Socket Option
+
+For same-host clients, a Unix domain socket avoids TCP loopback setup:
+
+```sh
+cargo run --bin cachebox -- --native-unix /tmp/cachebox.sock
+```
 
 ```rust
 let mut client = NativeClient::connect_unix("/tmp/cachebox.sock").await?;
 ```
 
-## Check Health And Metrics
+## Memory And Cleanup Defaults
 
-Admin HTTP is not the cache data plane. It exposes only health and metrics:
+The default configuration is intentionally bounded:
+
+```text
+max frame payload: 8 MiB
+max value size:    8 MiB
+max cache memory:  64 MiB
+cleanup interval: 250 ms
+cleanup budget:   128 expired entries per tick
+```
+
+Override limits when starting the server:
+
+```sh
+cargo run --bin cachebox -- \
+  --max-body-bytes 8388608 \
+  --max-memory-bytes 67108864 \
+  --max-value-bytes 8388608 \
+  --cleanup-interval-ms 250 \
+  --cleanup-max-entries-per-tick 128
+```
+
+Use `--cleanup-interval-ms 0` to disable the background expiration worker.
+Metrics remain observational; reading metrics does not reclaim expired entries.
+
+## Health, Metrics, And Benchmarks
+
+Health:
 
 ```sh
 curl 'http://127.0.0.1:7400/healthz'
+```
+
+Metrics:
+
+```sh
 curl 'http://127.0.0.1:7400/metrics'
 ```
 
-## Run Tests
-
-```sh
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
-
-## Run Benchmarks
+Local benchmark harness:
 
 ```sh
 cargo run --bin cachebox-bench
 ```
+
+The benchmark output is for comparing changes on the same machine. See
+[benchmarks.md](benchmarks.md) for the current table and scenario descriptions.

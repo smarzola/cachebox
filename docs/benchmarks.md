@@ -31,10 +31,11 @@ scenario, measures for a fixed duration, and prints one row per scenario.
 
 - `single_key_get`: cached GET hit.
 - `single_key_put`: unique-key PUT writes.
-- `engine_get`: in-process engine cached hit without HTTP.
-- `engine_put`: in-process engine unique-key write without HTTP.
+- `engine_get`: in-process engine cached hit without socket or protocol work.
+- `engine_put`: in-process engine unique-key write without socket or protocol
+  work.
 - `engine_tag_invalidate_8`: in-process invalidation of eight tagged keys
-  without HTTP. Setup writes are outside the timed sample.
+  without socket or protocol work. Setup writes are outside the timed sample.
 - `protocol_decode_get`: decode a prebuilt native GET frame without engine or
   socket work.
 - `protocol_encode_hit`: encode a borrowed native HIT response without engine

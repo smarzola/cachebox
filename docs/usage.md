@@ -1,9 +1,14 @@
 # Usage Guide
 
-Cachebox stores raw-byte values under byte keys scoped by an ASCII namespace.
-Cache operations use the native socket protocol over TCP or Unix sockets.
+Cachebox stores raw bytes under byte keys, scoped by namespaces. The server
+does not need to understand your application objects. Your application chooses
+stable keys, writes bytes, and attaches the cache metadata that describes how
+those bytes should age and be invalidated.
 
-All examples use:
+Use this guide to choose the right operation and understand the behavior you
+get from each feature.
+
+All Rust examples use:
 
 ```rust
 use cachebox::api::Ttl;
@@ -11,36 +16,43 @@ use cachebox::client::NativeClient;
 use cachebox::protocol::{BatchItem, Command, Metadata, RequestPayload, ResponsePayload};
 ```
 
-Connect over the default native TCP listener:
+Connect over TCP:
 
 ```rust
 let mut client = NativeClient::connect_tcp("127.0.0.1:7401").await?;
 ```
 
-Connect over a Unix socket when the server is started with `--native-unix`:
+Connect over a Unix socket:
 
 ```rust
 let mut client = NativeClient::connect_unix("/tmp/cachebox.sock").await?;
 ```
 
-## Namespaces And Keys
+## Keys And Namespaces
 
-Namespaces may contain ASCII letters, numbers, `-`, and `_`.
+Use namespaces to separate tenants, products, environments, or broad feature
+areas. Namespaces are ASCII strings containing letters, numbers, `-`, and `_`.
+Tags use the same readable style and also allow `:`, `.`, and `/`, which is
+useful for names like `user:123`, `org.9`, or `prompt/template/v2`.
 
-Keys are bytes. The native protocol does not require percent encoding:
+Keys are raw bytes. That means you can use a readable string key:
 
 ```rust
-client
-    .put(
-        "default",
-        b"user:123/profile".to_vec(),
-        Metadata::default(),
-        b"profile bytes".to_vec(),
-    )
-    .await?;
+b"user:123/profile".to_vec()
 ```
 
-## Put
+or a binary digest:
+
+```rust
+vec![0x9f, 0x86, 0xd0, 0x81]
+```
+
+The native protocol carries bytes directly, so keys do not need percent
+encoding.
+
+## Put: Store Raw Bytes
+
+Use `put` when your application has a value ready to cache:
 
 ```rust
 let evicted = client
@@ -53,99 +65,90 @@ let evicted = client
     .await?;
 ```
 
-`put` stores the value exactly as raw bytes. It returns the number of entries
-evicted to make room for the write.
+The return value is the number of entries evicted to make room for the write.
+For most normal writes it is `0`.
 
-## Get
+Use metadata to describe freshness and invalidation:
+
+```rust
+client
+    .put(
+        "default",
+        b"user:123/dashboard".to_vec(),
+        Metadata {
+            ttl: Some(Ttl {
+                milliseconds: 300_000,
+            }),
+            stale_ttl: Some(Ttl {
+                milliseconds: 60_000,
+            }),
+            tags: vec!["user:123".to_string(), "dashboard".to_string()],
+            cost: Some(1200),
+            ..Metadata::default()
+        },
+        b"rendered dashboard".to_vec(),
+    )
+    .await?;
+```
+
+Choose metadata deliberately:
+
+- Use `ttl` when a value is trustworthy for a fixed fresh lifetime.
+- Use `stale_ttl` when serving old bytes is better than forcing every caller to
+  recompute at once.
+- Use `tags` when you will need group invalidation.
+- Use `cost` to record the approximate recomputation cost for metrics and
+  future policy decisions.
+
+## Get: Read Fresh, Stale, Or Missing State
+
+Use `get` when you want one key:
 
 ```rust
 let response = client.get("default", b"dashboard:42".to_vec()).await?;
 
 match response {
     ResponsePayload::Hit(bytes) => {
-        assert_eq!(bytes, b"dashboard bytes".to_vec());
-    }
-    ResponsePayload::Stale(bytes) => {
+        // Fresh value.
         let _ = bytes;
     }
-    ResponsePayload::Miss => {}
+    ResponsePayload::Stale(bytes) => {
+        // Still readable, but a refresh should be considered.
+        let _ = bytes;
+    }
+    ResponsePayload::Miss => {
+        // Nothing readable exists.
+    }
     other => panic!("unexpected get response: {other:?}"),
 }
 ```
 
-Get outcomes:
+Cachebox keeps stale as a first-class state because many real workloads prefer
+bounded staleness over a thundering herd. A stale response is not a failure; it
+is a signal that the caller can serve old bytes while arranging refresh.
 
-- `Hit(bytes)` for a fresh value.
-- `Stale(bytes)` for a value inside its stale window.
-- `Miss` when no readable value exists.
+## Delete: Remove One Key
 
-## Delete
+Use `delete` for direct key removal:
 
 ```rust
 let removed = client.delete("default", b"dashboard:42".to_vec()).await?;
 ```
 
-Delete is idempotent. `removed` is `true` only when a stored entry existed.
+Delete is idempotent. `removed` is `true` only if a stored entry existed.
 
-## TTL
+## Batch Get: One Command, Many Keys
 
-Set the fresh lifetime with `Metadata::ttl`:
-
-```rust
-client
-    .put(
-        "default",
-        b"session:abc".to_vec(),
-        Metadata {
-            ttl: Some(Ttl {
-                milliseconds: 30_000,
-            }),
-            ..Metadata::default()
-        },
-        b"session bytes".to_vec(),
-    )
-    .await?;
-```
-
-## Stale TTL
-
-Set `stale_ttl` with `ttl` to keep serving an expired fresh value during a stale
-window:
-
-```rust
-client
-    .put(
-        "default",
-        b"report:weekly".to_vec(),
-        Metadata {
-            ttl: Some(Ttl {
-                milliseconds: 60_000,
-            }),
-            stale_ttl: Some(Ttl {
-                milliseconds: 300_000,
-            }),
-            ..Metadata::default()
-        },
-        b"rendered report".to_vec(),
-    )
-    .await?;
-```
-
-After the fresh TTL expires, reads can return `ResponsePayload::Stale(bytes)`.
-After the stale TTL expires, the key is treated as a miss.
-
-## Batch Get
-
-Batch get reads multiple byte keys in one request:
+Use `batch_get` when you have many keys and want one logical request:
 
 ```rust
 let items = client
     .batch_get(
         "default",
         vec![
-            b"a".to_vec(),
-            b"user:123".to_vec(),
-            b"bin\0\xff".to_vec(),
+            b"fragment:a".to_vec(),
+            b"fragment:b".to_vec(),
+            b"fragment:c".to_vec(),
         ],
     )
     .await?;
@@ -163,13 +166,14 @@ for item in items {
 }
 ```
 
-Each item reports hit, stale, or miss state.
+Batch get is best when every item is the same command shape. Response order
+matches the key order you sent.
 
-## Pipelined Requests
+## Pipelined Requests: Many Commands, One Connection Round
 
-Use `request_pipelined` when you want to send multiple independent native
-requests before waiting for responses. The helper matches responses by request
-id and returns payloads in the same order as the submitted requests:
+Use `request_pipelined` when you have independent requests and want to send
+them before waiting for individual responses. This keeps server semantics the
+same, but lets the connection stay busy.
 
 ```rust
 let responses = client
@@ -178,42 +182,38 @@ let responses = client
             Command::Get,
             RequestPayload::Get {
                 namespace: "default".to_string(),
-                key: b"a".to_vec(),
+                key: b"fragment:a".to_vec(),
             },
         ),
         (
             Command::Get,
             RequestPayload::Get {
                 namespace: "default".to_string(),
-                key: b"user:123".to_vec(),
+                key: b"fragment:b".to_vec(),
+            },
+        ),
+        (
+            Command::Delete,
+            RequestPayload::Delete {
+                namespace: "default".to_string(),
+                key: b"old-fragment".to_vec(),
             },
         ),
     ])
     .await?;
-
-for response in responses {
-    match response {
-        ResponsePayload::Hit(bytes) => {
-            let _ = bytes;
-        }
-        ResponsePayload::Stale(bytes) => {
-            let _ = bytes;
-        }
-        ResponsePayload::Miss => {}
-        other => {
-            let _ = other;
-        }
-    }
-}
 ```
 
-If any pipelined request returns a structured server error, the helper returns
-`ClientError::Server` after reading the response batch so the connection remains
-usable.
+The server may execute pipelined work concurrently and may respond out of
+order. The Rust client matches by request id and returns payloads in the same
+order as the submitted requests.
 
-## Tags
+If any request returns a structured server error, the helper returns
+`ClientError::Server` after reading the response batch, so the connection stays
+aligned for later use.
 
-Attach tags on write:
+## Tags: Invalidate Groups Without Knowing Every Key
+
+Use tags when many keys share an invalidation reason:
 
 ```rust
 client
@@ -233,53 +233,21 @@ client
     .await?;
 ```
 
-Invalidate all keys in a namespace with a tag:
+Invalidate one tag in one namespace:
 
 ```rust
 let removed = client.invalidate_tag("default", "user:123").await?;
 ```
 
-The return value is the number of removed entries.
+Internally, Cachebox maintains a tag directory that routes each
+`(namespace, tag)` to the shards that currently contain matching entries. That
+makes empty or narrow invalidations avoid scanning every shard. Ordinary gets
+and untagged puts do not take the tag directory lock.
 
-## Cost Metadata
+## Leases: Coordinate Expensive Refresh
 
-`Metadata::cost` stores a user-provided unsigned integer score. It is useful for
-measuring recomputation cost before enabling future cost-aware policy
-experiments:
-
-```rust
-client
-    .put(
-        "default",
-        b"llm:answer".to_vec(),
-        Metadata {
-            cost: Some(1200),
-            ttl: Some(Ttl {
-                milliseconds: 600_000,
-            }),
-            ..Metadata::default()
-        },
-        b"model output".to_vec(),
-    )
-    .await?;
-```
-
-The currently accounted aggregate is exposed by `/metrics`. Metrics reads are
-observational and do not reclaim expired entries:
-
-```text
-cachebox_cost_score_total 1200
-```
-
-Cost metadata is observational. It does not change the current approximate LRU
-eviction policy.
-
-## Leases
-
-Leases coordinate expensive recomputation so one client refreshes a missing or
-stale key while other clients avoid duplicating the same work.
-
-Start a lease:
+Use leases when recomputing a miss or stale value is expensive. A lease lets one
+client become the refresher while other clients avoid repeating the same work.
 
 ```rust
 let response = client
@@ -287,22 +255,26 @@ let response = client
     .await?;
 ```
 
-Possible states:
+Handle the possible states:
 
 ```rust
 match response {
     ResponsePayload::Hit(bytes) => {
+        // Fresh value already exists.
         let _ = bytes;
     }
     ResponsePayload::Stale(bytes) => {
+        // Another client owns the refresh lease; serve stale bytes if acceptable.
         let _ = bytes;
     }
     ResponsePayload::LeaseGranted {
         lease_token,
         stale_value,
     } => {
-        let generated = b"fresh generated bytes".to_vec();
+        // This client should recompute.
         let _ = stale_value;
+        let generated = b"fresh generated bytes".to_vec();
+
         client
             .complete_lease(
                 "default",
@@ -322,17 +294,18 @@ match response {
             .await?;
     }
     ResponsePayload::LeaseDenied => {
-        // Another client owns the active lease.
+        // Another client owns an active lease and no stale value is available.
     }
     other => panic!("unexpected lease response: {other:?}"),
 }
 ```
 
-Lease state is in-memory and process-local.
+Lease state is in-memory and process-local. If the process exits, active leases
+are gone with the cache.
 
-## Memory Limits And Eviction
+## Memory Limits, Expiration, And Eviction
 
-Start Cachebox with memory and value limits:
+Cachebox is memory bounded. Start it with explicit limits:
 
 ```sh
 cargo run --bin cachebox -- \
@@ -343,32 +316,29 @@ cargo run --bin cachebox -- \
   --cleanup-max-entries-per-tick 128
 ```
 
-Behavior:
+The limits mean:
 
-- Native frames with payloads over `--max-body-bytes` are rejected.
-- Single values over `--max-value-bytes` are rejected.
-- `--cleanup-interval-ms` controls the background expiration interval. Use `0`
-  to disable the background cleanup worker.
-- `--cleanup-max-entries-per-tick` limits how many expired entries the
-  background worker can reclaim in one tick.
-- Writes evict bounded-sample approximate least-recently-used entries when
-  memory is tight.
-- Expired entries are tracked in an expiry index and reclaimed by cache access
-  paths, the bounded background worker, or before live entries are evicted.
+- `--max-body-bytes`: largest accepted native frame payload.
+- `--max-value-bytes`: largest single cached value.
+- `--max-memory-bytes`: approximate cache memory budget.
+- `--cleanup-interval-ms`: background expiration worker interval.
+- `--cleanup-max-entries-per-tick`: expiration work budget per tick.
 
-## Health And Metrics
+Expiration and eviction are separate:
 
-Admin HTTP is intentionally separate from the native cache data plane.
+- Expiration removes entries whose TTL and stale TTL have both passed.
+- Eviction removes live entries when a write needs memory.
+- Eviction uses bounded-sample approximate LRU, so hot entries are likely to
+  stay without requiring a global ordered LRU structure.
+- Metrics and accounting accessors are observational; they do not trigger
+  cleanup side effects.
 
-Health:
+## Metrics
+
+Admin HTTP exposes health and metrics:
 
 ```sh
 curl 'http://127.0.0.1:7400/healthz'
-```
-
-Metrics:
-
-```sh
 curl 'http://127.0.0.1:7400/metrics'
 ```
 
@@ -389,9 +359,13 @@ cachebox_memory_limit_bytes
 cachebox_cost_score_total
 ```
 
+`cachebox_cost_score_total` is the sum of currently accounted entry cost
+metadata. It is useful for observability and planning, but it does not change
+eviction behavior in the current engine.
+
 ## Errors
 
-The native client returns `ClientError::Server` for structured server errors:
+The native client returns structured server errors as `ClientError::Server`:
 
 ```rust
 match client.get("bad namespace!", b"k".to_vec()).await {
@@ -402,4 +376,5 @@ match client.get("bad namespace!", b"k".to_vec()).await {
 }
 ```
 
-Protocol error codes are defined in `cachebox::protocol::ErrorCode`.
+Branch on the error code rather than the diagnostic message. See
+[protocol.md](protocol.md) for the full error-code table.

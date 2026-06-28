@@ -1,8 +1,13 @@
 # Native Sockets
 
 Cachebox can expose the binary native data plane over TCP and, on Unix
-platforms, Unix domain sockets. Cache operations use this native protocol.
-HTTP is admin-only and exposes health and metrics.
+platforms, Unix domain sockets. Cache operations use this native protocol:
+clients keep a connection open, send length-prefixed request frames, and read
+length-prefixed response frames. Admin HTTP exposes health and metrics.
+
+Use TCP when you need a normal loopback or network socket. Use a Unix socket
+when the client runs on the same host and you want lower local transport
+overhead plus filesystem permissions around the socket path.
 
 ## Start TCP
 
@@ -148,5 +153,21 @@ let bytes = encode_request_frame(&RequestFrame {
 });
 ```
 
-See [the native protocol specification](internal/native-socket-protocol.md) for
-frame layout, command IDs, payload fields, and error codes.
+## Connection Behavior
+
+Native connections are persistent. A client can send one request and wait for
+one response, or it can pipeline several requests before reading responses.
+
+Each request carries a `request_id`. The server echoes that id in the matching
+response. When a connection is pipelined, responses can arrive in a different
+order than requests because independent work may execute concurrently. The Rust
+client handles that by matching `request_id` values and returning pipelined
+payloads in submission order.
+
+The server closes a native connection if the buffered frame payload exceeds
+`--max-body-bytes`. Valid protocol errors, such as an invalid namespace or
+unknown command, are returned as structured error response frames when the
+server can decode enough of the frame to reply.
+
+See [protocol.md](protocol.md) for frame layout, command ids, payload fields,
+response status ids, error codes, and ordering rules.

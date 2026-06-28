@@ -1,73 +1,130 @@
 # Cachebox
 
-Cachebox is a self-hosted cache server for applications that need explicit
-cache semantics: raw-byte values, TTLs, stale windows, tag invalidation,
-bounded memory, metrics, and lease-based stampede protection.
+Cachebox is a small self-hosted cache server for applications that want
+explicit cache behavior without running a large service stack. It stores raw
+bytes behind byte keys, adds cache metadata such as TTLs and tags, coordinates
+stampede protection with leases, and exposes a compact native socket protocol
+over TCP or Unix domain sockets.
 
-The server runs as a single Rust binary. Cache operations use Cachebox's native
-socket protocol over TCP by default and Unix domain sockets when configured.
-HTTP is kept as an admin surface for health and Prometheus-style metrics.
+The shape is intentionally direct: one Rust binary, one in-memory cache engine,
+native sockets for cache traffic, and a small admin HTTP surface for health and
+metrics.
+
+## Why Cachebox
+
+Application caches often start as a map in process and become painful when
+multiple workers need shared state, TTLs, invalidation, and refresh
+coordination. Cachebox is meant for that middle ground:
+
+- You want one local or internal cache service that is easy to run.
+- You cache raw bytes, not database rows or provider-specific objects.
+- You need TTLs, stale reads, tags, and bounded memory.
+- You want cache stampede protection for expensive recomputation.
+- You want a simple protocol official clients can implement directly.
+- You care about predictable resource usage on small machines.
+
+Cachebox is useful for web fragments, generated reports, model responses,
+embedding artifacts, API responses, and other application-owned bytes where the
+application knows the right key and freshness policy.
 
 ## Design Principles
 
-- **Cache semantics first.** Reads, writes, TTLs, stale windows, tags, leases,
-  memory limits, and metrics are first-class operations.
-- **Native data plane.** Cache operations use a compact binary protocol instead
-  of HTTP routing, headers, and JSON envelopes.
-- **Raw bytes in the data path.** Values are stored and returned as bytes.
-  Structured metadata stays small and explicit.
-- **Self-hostable by default.** The binary should be easy to run on a laptop,
-  VPS, homelab machine, or small internal service.
-- **Bounded memory.** Cachebox accounts for approximate entry memory, enforces
-  configured limits, and evicts approximate least-recently-used entries under
-  pressure.
-- **Observable behavior.** Cache outcomes, errors, leases, expirations,
-  evictions, memory, and cost-score metadata are visible through `/metrics`.
-- **Provider-neutral helpers.** AI-oriented helpers build deterministic cache
-  keys and generation flows without calling model providers.
+- Keep cache semantics explicit: freshness, staleness, invalidation, leases,
+  and memory limits are visible operations rather than side effects hidden in a
+  generic key/value API.
+- Keep the data plane compact: cache traffic uses persistent native sockets
+  with fixed binary framing and request ids.
+- Keep values application-owned: Cachebox stores raw bytes and small metadata;
+  serialization belongs to the client.
+- Keep resource use bounded: memory has a configured cap, expiration work is
+  budgeted, and metrics reads do not mutate cache state.
+- Keep local operation practical: one binary should be easy to run on small
+  machines, sidecars, internal tools, and development environments.
 
-## Features
+## Design
 
-- Single `cachebox` server binary.
-- Native TCP cache data plane enabled by default on `127.0.0.1:7401`.
-- Optional native Unix socket data plane.
-- Admin HTTP health and metrics on `127.0.0.1:7400`.
-- Get, put, delete, batch get, tag invalidation, lease start, and lease
-  completion.
-- Namespaced byte keys and raw-byte values.
-- Fresh TTL and stale TTL metadata.
-- Tag-based invalidation.
-- Lease-based stampede protection for expensive recomputation.
-- Approximate memory accounting with max body, max value, and max memory limits.
-- Approximate LRU eviction.
-- Prometheus-style `/metrics`.
-- Reserved cost metadata with side-effect-free aggregate cost-score metrics.
-- Rust AI helper utilities for prompt keys, embedding keys, generation leases,
-  and buffer-then-commit stream capture.
-- Local benchmark harness for engine, native TCP, and native Unix socket paths.
+Cachebox is built around cache semantics rather than generic storage semantics.
+The main data-plane operations are:
+
+- `get`: read a fresh, stale, or missing value.
+- `put`: write bytes with optional TTL, stale TTL, tags, cost, and content
+  type metadata.
+- `delete`: remove one key.
+- `batch_get`: read many keys in one command.
+- `tag_invalidate`: remove all entries with a tag in one namespace.
+- `lease_start` and `lease_complete`: let exactly one client refresh a missing
+  or stale value while other clients avoid duplicated work.
+
+The native protocol keeps request framing compact and explicit. Responses echo
+the request id, so a client can pipeline many requests and match responses even
+when the server completes them out of order.
+
+Internally, Cachebox uses sharded in-memory maps, bounded cleanup, approximate
+LRU eviction, a routed tag directory, striped metrics counters, adaptive native
+connection execution, reusable connection buffers, and response batching for
+pipelined traffic. See [docs/internals.md](docs/internals.md) for the detailed
+implementation walkthrough.
+
+## Resource Profile
+
+Cachebox is designed to fit resource-constrained environments such as a small
+VPS, homelab host, sidecar-style process, or internal tool box.
+
+Local measurements on this macOS arm64 checkout:
+
+| Item | Observed value |
+| --- | ---: |
+| Optimized `cachebox` binary | `2.1 MB` |
+| Idle RSS with admin TCP, native TCP, and native Unix listeners | about `2.6 MiB` |
+| Default memory cap | `64 MiB` |
+| Default max value size | `8 MiB` |
+| Default max frame payload | `8 MiB` |
+
+The binary and idle RSS numbers are local measurements, not portable guarantees.
+The important operational point is that memory growth is bounded by the
+configured cache limit plus process overhead, and expired cleanup is budgeted so
+observability calls do not perform surprise reclamation work.
+
+## Performance Highlights
+
+Run the local benchmark harness with:
+
+```sh
+cargo run --bin cachebox-bench
+```
+
+Current local p50 highlights from [docs/benchmarks.md](docs/benchmarks.md):
+
+| Scenario | Transport | p50 |
+| --- | --- | ---: |
+| Engine cached get | in-process engine | `417 ns` |
+| Native Unix cached get | loopback Unix socket | `13.8 us` |
+| Native TCP cached get | loopback TCP | `25.1 us` |
+| Manual pipelined get, depth 32 | loopback Unix socket | `4.8 us/request` |
+| Official client pipelined get, depth 32 | loopback Unix socket | `5.7 us/request` |
+| Empty tag invalidation | loopback Unix socket | `14.3 us` |
+| Eight-key tag invalidation | loopback Unix socket | `30.0 us` |
+
+These numbers are local loopback measurements for comparing changes on the
+same machine. They are not production latency promises.
 
 ## Quickstart
 
-Build:
+Build and run the server:
 
 ```sh
 cargo build
-```
-
-Run:
-
-```sh
 cargo run --bin cachebox
 ```
 
-The default listeners are:
+Default listeners:
 
 ```text
 admin HTTP: 127.0.0.1:7400
 native TCP: 127.0.0.1:7401
 ```
 
-Use the Rust native client:
+Store and read bytes with the Rust native client:
 
 ```rust
 use cachebox::api::Ttl;
@@ -86,6 +143,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ttl: Some(Ttl {
                     milliseconds: 300_000,
                 }),
+                stale_ttl: Some(Ttl {
+                    milliseconds: 60_000,
+                }),
                 tags: vec!["user:123".to_string(), "org:9".to_string()],
                 cost: Some(42),
                 ..Metadata::default()
@@ -97,20 +157,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let value = client.get("default", b"user:123".to_vec()).await?;
     assert_eq!(value, ResponsePayload::Hit(b"cached bytes".to_vec()));
 
-    assert!(client.delete("default", b"user:123".to_vec()).await?);
-
     Ok(())
 }
 ```
 
-Check admin metrics:
+Check health and metrics:
 
 ```sh
+curl 'http://127.0.0.1:7400/healthz'
 curl 'http://127.0.0.1:7400/metrics'
 ```
-
-More examples are in [docs/quickstart.md](docs/quickstart.md) and
-[docs/usage.md](docs/usage.md).
 
 ## Configuration
 
@@ -132,33 +188,18 @@ Show all options:
 cargo run --bin cachebox -- --help
 ```
 
-## Benchmarks
-
-Run the local benchmark harness:
-
-```sh
-cargo run --bin cachebox-bench
-```
-
-The harness covers cached hits, unique writes, batch reads, lease contention,
-tag invalidation, TTL-heavy writes, eviction pressure, and cost-shaped writes
-across engine, native TCP, and native Unix socket paths. Current baseline output
-and scenario descriptions are in [docs/benchmarks.md](docs/benchmarks.md).
-
 ## Documentation
 
-User-facing docs:
-
-- [Documentation index](docs/README.md)
 - [Quickstart](docs/quickstart.md)
 - [Usage guide](docs/usage.md)
 - [Native sockets](docs/native-sockets.md)
+- [Protocol specification](docs/protocol.md)
+- [Internals and performance design](docs/internals.md)
 - [AI helpers](docs/ai-helpers.md)
 - [Benchmarks](docs/benchmarks.md)
 
-Internal docs:
-
-- [Internal docs](docs/internal/)
+Internal planning notes and development checkpoints live under
+[docs/internal/](docs/internal/).
 
 ## Development
 
@@ -168,33 +209,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Ignored spawned-binary smoke tests can be run explicitly:
+Spawned-binary smoke tests:
 
 ```sh
 cargo test --test spawned_client -- --ignored
-```
-
-## Repository Layout
-
-```text
-src/
-  ai.rs                AI-oriented helper utilities
-  api.rs               shared metadata and admin HTTP route constants
-  client.rs            native socket client
-  config.rs            CLI and startup configuration parsing
-  engine.rs            in-memory cache engine
-  lib.rs               library module exports
-  main.rs              binary entrypoint
-  protocol.rs          native socket protocol codec
-  server.rs            admin HTTP and native socket server
-docs/
-  README.md            documentation index
-  quickstart.md        first-run guide
-  usage.md             user-facing native client examples
-  native-sockets.md    native socket protocol and client usage
-  ai-helpers.md        AI helper examples
-  benchmarks.md        benchmark command and baseline
-  internal/            planning, architecture, and historical notes
-tests/
-  spawned_client.rs    spawned-binary smoke tests
 ```
