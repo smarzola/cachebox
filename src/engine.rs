@@ -168,28 +168,41 @@ where
     }
 
     pub fn get(&mut self, namespace: &str, key: &[u8]) -> GetOutcome {
+        self.get_ref(namespace, key, |outcome| match outcome {
+            GetOutcomeRef::Hit(value) => GetOutcome::Hit(value.to_vec()),
+            GetOutcomeRef::Stale(value) => GetOutcome::Stale(value.to_vec()),
+            GetOutcomeRef::Miss => GetOutcome::Miss,
+        })
+    }
+
+    pub fn get_ref<R>(
+        &mut self,
+        namespace: &str,
+        key: &[u8],
+        map: impl FnOnce(GetOutcomeRef<'_>) -> R,
+    ) -> R {
         let id = EntryId::new(namespace, key);
         let now_ms = self.clock.now_ms();
         let Some(entry) = self.entries.get_mut(&id) else {
-            return GetOutcome::Miss;
+            return map(GetOutcomeRef::Miss);
         };
         match entry_state_at(entry, now_ms) {
-            EntryState::Missing => GetOutcome::Miss,
+            EntryState::Missing => map(GetOutcomeRef::Miss),
             EntryState::Expired => {
                 self.remove_entry(&id);
-                GetOutcome::Miss
+                map(GetOutcomeRef::Miss)
             }
             EntryState::Fresh => {
                 let access = self.next_access;
                 self.next_access = self.next_access.saturating_add(1);
                 entry.last_access = access;
-                GetOutcome::Hit(entry.value.clone())
+                map(GetOutcomeRef::Hit(&entry.value))
             }
             EntryState::Stale => {
                 let access = self.next_access;
                 self.next_access = self.next_access.saturating_add(1);
                 entry.last_access = access;
-                GetOutcome::Stale(entry.value.clone())
+                map(GetOutcomeRef::Stale(&entry.value))
             }
         }
     }
@@ -557,6 +570,13 @@ pub enum GetOutcome {
     Miss,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetOutcomeRef<'a> {
+    Hit(&'a [u8]),
+    Stale(&'a [u8]),
+    Miss,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct EntryId {
     namespace: String,
@@ -709,6 +729,25 @@ mod tests {
             GetOutcome::Hit(b"value\0\xff".to_vec())
         );
         assert_eq!(engine.get("other", b"user\0\xff"), GetOutcome::Miss);
+    }
+
+    #[test]
+    fn get_ref_exposes_value_without_changing_owned_get_behavior() {
+        let (mut engine, _) = engine();
+        engine
+            .put(put("default", b"k", b"value"))
+            .expect("put should fit");
+
+        let observed = engine.get_ref("default", b"k", |outcome| match outcome {
+            GetOutcomeRef::Hit(value) => value.to_vec(),
+            other => panic!("expected hit, got {other:?}"),
+        });
+
+        assert_eq!(observed, b"value".to_vec());
+        assert_eq!(
+            engine.get("default", b"k"),
+            GetOutcome::Hit(b"value".to_vec())
+        );
     }
 
     #[test]

@@ -191,6 +191,13 @@ pub enum BatchItem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsePayloadView<'a> {
+    Hit(&'a [u8]),
+    Stale(&'a [u8]),
+    Miss,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     BadFrame,
     UnsupportedVersion,
@@ -402,6 +409,22 @@ pub fn encode_response_frame_into(frame: &ResponseFrame, out: &mut Vec<u8>) {
         frame.request_id,
         &frame.payload,
         encode_response_payload,
+        out,
+    );
+}
+
+pub fn encode_response_payload_view_frame_into(
+    request_id: u64,
+    command: Command,
+    payload: ResponsePayloadView<'_>,
+    out: &mut Vec<u8>,
+) {
+    encode_frame_into(
+        KIND_RESPONSE,
+        command,
+        request_id,
+        &payload,
+        encode_response_payload_view,
         out,
     );
 }
@@ -724,6 +747,20 @@ fn encode_response_payload(payload: &ResponsePayload, out: &mut Vec<u8>) {
                 }
             }
         }
+    }
+}
+
+fn encode_response_payload_view(payload: &ResponsePayloadView<'_>, out: &mut Vec<u8>) {
+    match payload {
+        ResponsePayloadView::Hit(value) => {
+            out.push(0x01);
+            write_bytes(out, value);
+        }
+        ResponsePayloadView::Stale(value) => {
+            out.push(0x02);
+            write_bytes(out, value);
+        }
+        ResponsePayloadView::Miss => out.push(0x03),
     }
 }
 
@@ -1124,6 +1161,26 @@ mod tests {
         assert_eq!(encoded[24], 0x01);
         assert_eq!(u32::from_be_bytes(encoded[25..29].try_into().unwrap()), 5);
         assert_eq!(&encoded[29..34], b"bytes");
+    }
+
+    #[test]
+    fn encodes_borrowed_response_payload_view() {
+        let mut buffer = Vec::new();
+        encode_response_payload_view_frame_into(
+            7,
+            Command::Get,
+            ResponsePayloadView::Hit(b"bytes"),
+            &mut buffer,
+        );
+
+        assert_eq!(
+            decode_response_frame(&buffer, MAX_PAYLOAD).expect("response frame"),
+            ResponseFrame {
+                request_id: 7,
+                command: Command::Get,
+                payload: ResponsePayload::Hit(b"bytes".to_vec()),
+            }
+        );
     }
 
     #[test]

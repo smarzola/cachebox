@@ -57,31 +57,31 @@ cargo run --bin cachebox-bench
 
 ```text
 scenario transport iterations p50_ns p95_ns p99_ns throughput_ops_s memory_used_bytes cost_score_total notes
-engine_get engine 1828185 458 500 1209 1828184.16 113 0 engine_cached_hit
-engine_put engine 454248 1791 2250 2750 454247.47 52593958 0 engine_unique_keys
-engine_tag_invalidate_8 engine 41413 8167 8958 11334 120689.57 0 0 remove_8_tagged_keys
-single_key_get loopback_tcp 41944 23166 28708 48750 41943.54 0 0 cached_hit
-single_key_put loopback_tcp 38105 25709 28667 40167 38104.69 0 0 unique_keys
-batch_get_32 loopback_tcp 15003 67000 72209 83416 15002.67 0 0 32_keys
-lease_contention loopback_tcp 39467 25458 28000 39667 39466.67 0 0 same_missing_key
-tag_invalidate_empty loopback_tcp 42609 23000 27166 37291 42608.56 0 0 single_empty_invalidate
-tag_invalidate_8 loopback_tcp 3845 35417 38417 49791 28033.61 0 0 single_invalidate_8_tagged_keys
-tag_workflow_put8_invalidate loopback_tcp 3819 260542 284083 310917 3818.81 0 0 8_puts_plus_invalidate
-ttl_heavy_writes loopback_tcp 36664 26166 31000 40792 36663.83 0 0 ttl_and_stale_ttl
-concurrent_get_16 loopback_tcp 153777 100458 165417 199167 153715.23 0 0 16_clients_cached_hit
-concurrent_put_16 loopback_tcp 143614 102459 171166 206708 143514.11 0 0 16_clients_unique_keys
-short_connection_get loopback_tcp 13327 70250 77042 92000 13326.03 0 0 connect_get_close
-single_key_get loopback_unix 68333 14083 17084 28875 68332.44 0 0 cached_hit
-single_key_put loopback_unix 60950 15250 18625 28458 60949.62 0 0 unique_keys
-batch_get_32 loopback_unix 21598 43833 57542 63416 21597.12 0 0 32_keys
-lease_contention loopback_unix 69065 13958 17875 27916 69064.44 0 0 same_missing_key
-tag_invalidate_empty loopback_unix 71404 13208 16709 28375 71403.60 0 0 single_empty_invalidate
-tag_invalidate_8 loopback_unix 5768 25916 29041 39417 39021.69 0 0 single_invalidate_8_tagged_keys
-tag_workflow_put8_invalidate loopback_unix 5772 172583 190125 211542 5771.01 0 0 8_puts_plus_invalidate
-ttl_heavy_writes loopback_unix 54809 17083 20375 30000 54808.17 0 0 ttl_and_stale_ttl
-concurrent_get_16 loopback_unix 222149 70000 119125 143625 222079.89 0 0 16_clients_cached_hit
-concurrent_put_16 loopback_unix 189174 74708 128167 157708 189127.47 0 0 16_clients_unique_keys
-short_connection_get loopback_unix 28232 32000 37916 55083 28231.77 0 0 connect_get_close
+engine_get engine 2007089 417 541 875 2007088.00 113 0 engine_cached_hit
+engine_put engine 453296 1791 2209 2792 453295.96 52483526 0 engine_unique_keys
+engine_tag_invalidate_8 engine 41516 8125 8375 10833 121633.28 0 0 remove_8_tagged_keys
+single_key_get loopback_tcp 40954 23500 28750 51459 40953.97 0 0 cached_hit
+single_key_put loopback_tcp 38139 25708 28291 40458 38138.85 0 0 unique_keys
+batch_get_32 loopback_tcp 15098 65417 71833 86875 15097.80 0 0 32_keys
+lease_contention loopback_tcp 39569 25458 27792 40208 39568.56 0 0 same_missing_key
+tag_invalidate_empty loopback_tcp 42212 23125 27292 37750 42211.08 0 0 single_empty_invalidate
+tag_invalidate_8 loopback_tcp 3841 35375 38416 50250 28007.84 0 0 single_invalidate_8_tagged_keys
+tag_workflow_put8_invalidate loopback_tcp 3844 256541 278667 317708 3843.30 0 0 8_puts_plus_invalidate
+ttl_heavy_writes loopback_tcp 37116 26000 29875 41084 37115.13 0 0 ttl_and_stale_ttl
+concurrent_get_16 loopback_tcp 152504 100583 169167 205875 152457.11 0 0 16_clients_cached_hit
+concurrent_put_16 loopback_tcp 143758 102833 170042 204417 143719.17 0 0 16_clients_unique_keys
+short_connection_get loopback_tcp 13228 70583 77417 96834 13227.48 0 0 connect_get_close
+single_key_get loopback_unix 69021 13834 17375 28750 69020.04 0 0 cached_hit
+single_key_put loopback_unix 61547 15208 18583 28666 61546.94 0 0 unique_keys
+batch_get_32 loopback_unix 21234 44125 57958 66333 21233.44 0 0 32_keys
+lease_contention loopback_unix 68231 14000 17916 27916 68230.07 0 0 same_missing_key
+tag_invalidate_empty loopback_unix 71514 13125 17000 28584 71513.96 0 0 single_empty_invalidate
+tag_invalidate_8 loopback_unix 5687 26333 29209 40083 38266.66 0 0 single_invalidate_8_tagged_keys
+tag_workflow_put8_invalidate loopback_unix 5695 174125 192042 225917 5694.72 0 0 8_puts_plus_invalidate
+ttl_heavy_writes loopback_unix 54561 17167 20667 30542 54560.37 0 0 ttl_and_stale_ttl
+concurrent_get_16 loopback_unix 215770 71500 124250 154584 215713.85 0 0 16_clients_cached_hit
+concurrent_put_16 loopback_unix 190040 74292 128208 158916 189993.13 0 0 16_clients_unique_keys
+short_connection_get loopback_unix 28193 32125 38125 55792 28192.52 0 0 connect_get_close
 ```
 
 The engine-only rows show the in-memory cache path is sub-microsecond for hot

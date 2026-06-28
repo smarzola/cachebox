@@ -23,14 +23,14 @@ use tokio::time::MissedTickBehavior;
 
 use crate::config::Config;
 use crate::engine::{
-    CompleteLeaseCommand, CompleteLeaseError, Engine, EngineLimits, GetOutcome, PutCommand,
-    PutError, StartLeaseOutcome,
+    CompleteLeaseCommand, CompleteLeaseError, Engine, EngineLimits, GetOutcome, GetOutcomeRef,
+    PutCommand, PutError, StartLeaseOutcome,
 };
 use crate::protocol::{
     BatchItem, Command, DecodeError, ErrorCode, HEADER_LEN, Metadata as NativeMetadata,
     RequestFrame, RequestFrameView, RequestPayload, RequestPayloadView, ResponseFrame,
     ResponsePayload, decode_borrowed_request_frame, decode_request_frame,
-    encode_response_frame_into,
+    encode_response_frame_into, encode_response_payload_view_frame_into,
 };
 
 #[derive(Debug, Clone)]
@@ -362,7 +362,21 @@ where
         stream.read_exact(&mut frame[start..]).await?;
 
         let response = match decode_borrowed_request_frame(&frame, max_payload_len) {
-            Ok(Some(request)) => execute_native_request_view(&state, request),
+            Ok(Some(request)) => {
+                if let RequestPayloadView::Get { namespace, key } = request.payload {
+                    encode_native_get_response_frame(
+                        &state,
+                        request.request_id,
+                        request.command,
+                        namespace,
+                        key,
+                        &mut response_buffer,
+                    );
+                    stream.write_all(&response_buffer).await?;
+                    continue;
+                }
+                execute_native_request_view(&state, request)
+            }
             Ok(None) => match decode_request_frame(&frame, max_payload_len) {
                 Ok(request) => execute_native_request(&state, request),
                 Err(error) => {
@@ -620,6 +634,50 @@ fn execute_native_get(state: &AppState, namespace: &str, key: &[u8]) -> Response
             ResponsePayload::Miss
         }
     }
+}
+
+fn encode_native_get_response_frame(
+    state: &AppState,
+    request_id: u64,
+    command: Command,
+    namespace: &str,
+    key: &[u8],
+    out: &mut Vec<u8>,
+) {
+    state.metrics.get_requests.fetch_add(1, Ordering::Relaxed);
+    state
+        .engine
+        .lock()
+        .expect("engine mutex poisoned")
+        .get_ref(namespace, key, |outcome| match outcome {
+            GetOutcomeRef::Hit(value) => {
+                state.metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+                encode_response_payload_view_frame_into(
+                    request_id,
+                    command,
+                    crate::protocol::ResponsePayloadView::Hit(value),
+                    out,
+                );
+            }
+            GetOutcomeRef::Stale(value) => {
+                state.metrics.stale_total.fetch_add(1, Ordering::Relaxed);
+                encode_response_payload_view_frame_into(
+                    request_id,
+                    command,
+                    crate::protocol::ResponsePayloadView::Stale(value),
+                    out,
+                );
+            }
+            GetOutcomeRef::Miss => {
+                state.metrics.misses_total.fetch_add(1, Ordering::Relaxed);
+                encode_response_payload_view_frame_into(
+                    request_id,
+                    command,
+                    crate::protocol::ResponsePayloadView::Miss,
+                    out,
+                );
+            }
+        });
 }
 
 fn execute_native_lease_start(
