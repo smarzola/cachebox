@@ -13,6 +13,7 @@ from .client import (
     ServerError,
     UnexpectedResponse,
 )
+from .cache import AsyncCachebox, CacheBackend, AsyncCacheBackend, Cachebox
 from .keys import (
     KeyBuildError,
     KeyOptions,
@@ -44,7 +45,11 @@ __all__ = [
     "ConnectionClosed",
     "ServerError",
     "UnexpectedResponse",
+    "AsyncCacheBackend",
+    "AsyncCachebox",
     "BytesSerializer",
+    "CacheBackend",
+    "Cachebox",
     "DecodeError",
     "EncodeError",
     "JsonSerializer",

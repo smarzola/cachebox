@@ -7,8 +7,9 @@ distributions without requiring a Rust toolchain.
 
 The current package includes a pure Python native protocol codec, synchronous
 socket client, asyncio client, optional sync/async connection pools,
-serializer helpers, and deterministic key builders. Decorators and dogpile
-protection are implemented in follow-up native Python milestones.
+serializer helpers, deterministic key builders, and high-level sync/async
+caching APIs. Dogpile protection is implemented in a follow-up native Python
+milestone.
 
 ## Local Development
 
@@ -28,22 +29,37 @@ uv build clients/python
 ## Example
 
 ```python
-from cachebox import AsyncClient, Client, protocol
+from cachebox import AsyncCachebox, Cachebox, JsonSerializer
 
-with Client.connect_tcp("127.0.0.1:7401") as client:
-    client.put("default", b"user:123", b"cached bytes")
+with Cachebox.connect_tcp(
+    "127.0.0.1:7401",
+    serializer=JsonSerializer(),
+    key_prefix="app",
+    key_version=1,
+) as cache:
+    cache.set("user:123", {"id": 123, "name": "Ada"}, ttl_ms=60_000, tags=("users",))
 
-    result = client.get("default", b"user:123")
-    assert result == protocol.Hit(b"cached bytes")
+    result = cache.get("user:123")
+    assert result == {"id": 123, "name": "Ada"}
 
-async with await AsyncClient.connect_tcp("127.0.0.1:7401") as client:
-    await client.put("default", b"user:456", b"cached bytes")
+    @cache.memoize(ttl_ms=60_000, tags=("users",))
+    def load_user(user_id: int):
+        return {"id": user_id}
 
-    result = await client.get("default", b"user:456")
-    assert result == protocol.Hit(b"cached bytes")
+    assert load_user(456) == {"id": 456}
+
+async with await AsyncCachebox.connect_tcp(
+    "127.0.0.1:7401",
+    serializer=JsonSerializer(),
+) as cache:
+    await cache.set("user:789", {"id": 789}, ttl_ms=60_000)
+
+    result = await cache.get("user:789")
+    assert result == {"id": 789}
 ```
 
-High-level cache APIs build on explicit serializers and deterministic keys:
+Low-level clients and high-level cache APIs build on explicit serializers and
+deterministic keys:
 
 ```python
 from cachebox import JsonSerializer, build_function_key, make_metadata
