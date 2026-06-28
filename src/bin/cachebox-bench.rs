@@ -20,6 +20,7 @@ use tokio::runtime::Runtime;
 
 const WARMUP_ITERS: usize = 100;
 const MEASURE_DURATION: Duration = Duration::from_secs(1);
+const CONCURRENT_CLIENTS: usize = 16;
 
 macro_rules! warmup_async {
     ($body:block) => {
@@ -70,6 +71,9 @@ async fn async_main() {
         bench_native_tag_invalidate_8(&mut native_client).await,
         bench_native_tag_invalidation(&mut native_client).await,
         bench_native_ttl_heavy_writes(&mut native_client).await,
+        bench_native_concurrent_get_tcp(&native_server.addr).await,
+        bench_native_concurrent_put_tcp(&native_server.addr).await,
+        bench_native_short_connection_get_tcp(&native_server.addr).await,
     ];
 
     #[cfg(unix)]
@@ -85,6 +89,9 @@ async fn async_main() {
             bench_native_tag_invalidate_8(&mut native_unix_client).await,
             bench_native_tag_invalidation(&mut native_unix_client).await,
             bench_native_ttl_heavy_writes(&mut native_unix_client).await,
+            bench_native_concurrent_get_unix(&native_unix_server.path).await,
+            bench_native_concurrent_put_unix(&native_unix_server.path).await,
+            bench_native_short_connection_get_unix(&native_unix_server.path).await,
         ]);
         native_unix_server.cleanup();
     }
@@ -406,6 +413,240 @@ async fn bench_native_ttl_heavy_writes(client: &mut NativeClient) -> BenchResult
             ResponsePayload::Stored { evicted: 0 }
         );
     })
+}
+
+async fn bench_native_concurrent_get_tcp(addr: &str) -> BenchResult {
+    let mut setup = NativeClient::connect_tcp(addr).await;
+    let addr = addr.to_string();
+    bench_native_concurrent_get(
+        "loopback_tcp",
+        move || {
+            let addr = addr.clone();
+            async move { NativeClient::connect_tcp(&addr).await }
+        },
+        &mut setup,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn bench_native_concurrent_get_unix(path: &Path) -> BenchResult {
+    let mut setup = NativeClient::connect_unix(path).await;
+    let path = path.to_path_buf();
+    bench_native_concurrent_get(
+        "loopback_unix",
+        move || {
+            let path = path.clone();
+            async move { NativeClient::connect_unix(&path).await }
+        },
+        &mut setup,
+    )
+    .await
+}
+
+async fn bench_native_concurrent_put_tcp(addr: &str) -> BenchResult {
+    let addr = addr.to_string();
+    bench_native_concurrent_put("loopback_tcp", move || {
+        let addr = addr.clone();
+        async move { NativeClient::connect_tcp(&addr).await }
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn bench_native_concurrent_put_unix(path: &Path) -> BenchResult {
+    let path = path.to_path_buf();
+    bench_native_concurrent_put("loopback_unix", move || {
+        let path = path.clone();
+        async move { NativeClient::connect_unix(&path).await }
+    })
+    .await
+}
+
+async fn bench_native_short_connection_get_tcp(addr: &str) -> BenchResult {
+    let mut setup = NativeClient::connect_tcp(addr).await;
+    let addr = addr.to_string();
+    bench_native_short_connection_get(
+        "loopback_tcp",
+        move || {
+            let addr = addr.clone();
+            async move { NativeClient::connect_tcp(&addr).await }
+        },
+        &mut setup,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn bench_native_short_connection_get_unix(path: &Path) -> BenchResult {
+    let mut setup = NativeClient::connect_unix(path).await;
+    let path = path.to_path_buf();
+    bench_native_short_connection_get(
+        "loopback_unix",
+        move || {
+            let path = path.clone();
+            async move { NativeClient::connect_unix(&path).await }
+        },
+        &mut setup,
+    )
+    .await
+}
+
+async fn bench_native_concurrent_get<F, Fut>(
+    transport: &'static str,
+    connect: F,
+    setup: &mut NativeClient,
+) -> BenchResult
+where
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = NativeClient> + Send + 'static,
+{
+    assert_eq!(
+        setup
+            .request(
+                Command::Put,
+                native_put_payload(b"concurrent-get-key", Metadata::default(), b"value")
+            )
+            .await,
+        ResponsePayload::Stored { evicted: 0 }
+    );
+
+    let started = Instant::now();
+    let deadline = started + MEASURE_DURATION;
+    let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
+    for _ in 0..CONCURRENT_CLIENTS {
+        let connect = connect.clone();
+        handles.push(tokio::spawn(async move {
+            let mut client = connect().await;
+            let mut samples = Vec::new();
+            while Instant::now() < deadline {
+                let sample_started = Instant::now();
+                assert_eq!(
+                    client
+                        .request(Command::Get, native_get_payload(b"concurrent-get-key"))
+                        .await,
+                    ResponsePayload::Hit(b"value".to_vec())
+                );
+                samples.push(sample_started.elapsed());
+            }
+            samples
+        }));
+    }
+    summarize_joined_samples(
+        "concurrent_get_16",
+        transport,
+        "16_clients_cached_hit",
+        started,
+        handles,
+    )
+    .await
+}
+
+async fn bench_native_concurrent_put<F, Fut>(transport: &'static str, connect: F) -> BenchResult
+where
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = NativeClient> + Send + 'static,
+{
+    let started = Instant::now();
+    let deadline = started + MEASURE_DURATION;
+    let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
+    for client_index in 0..CONCURRENT_CLIENTS {
+        let connect = connect.clone();
+        handles.push(tokio::spawn(async move {
+            let mut client = connect().await;
+            let mut samples = Vec::new();
+            let mut index = 0usize;
+            while Instant::now() < deadline {
+                let key = format!("concurrent-put-{client_index}-{index}");
+                index += 1;
+                let sample_started = Instant::now();
+                assert_eq!(
+                    client
+                        .request(
+                            Command::Put,
+                            native_put_payload(key.as_bytes(), Metadata::default(), b"value")
+                        )
+                        .await,
+                    ResponsePayload::Stored { evicted: 0 }
+                );
+                samples.push(sample_started.elapsed());
+            }
+            samples
+        }));
+    }
+    summarize_joined_samples(
+        "concurrent_put_16",
+        transport,
+        "16_clients_unique_keys",
+        started,
+        handles,
+    )
+    .await
+}
+
+async fn bench_native_short_connection_get<F, Fut>(
+    transport: &'static str,
+    connect: F,
+    setup: &mut NativeClient,
+) -> BenchResult
+where
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = NativeClient> + Send + 'static,
+{
+    assert_eq!(
+        setup
+            .request(
+                Command::Put,
+                native_put_payload(b"short-connection-key", Metadata::default(), b"value")
+            )
+            .await,
+        ResponsePayload::Stored { evicted: 0 }
+    );
+    warmup_async!({
+        let mut client = connect().await;
+        assert_eq!(
+            client
+                .request(Command::Get, native_get_payload(b"short-connection-key"))
+                .await,
+            ResponsePayload::Hit(b"value".to_vec())
+        );
+    });
+
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let sample_started = Instant::now();
+        let mut client = connect().await;
+        assert_eq!(
+            client
+                .request(Command::Get, native_get_payload(b"short-connection-key"))
+                .await,
+            ResponsePayload::Hit(b"value".to_vec())
+        );
+        samples.push(sample_started.elapsed());
+    }
+    summarize(
+        "short_connection_get",
+        transport,
+        "connect_get_close",
+        samples,
+        started.elapsed(),
+        0,
+    )
+}
+
+async fn summarize_joined_samples(
+    name: &'static str,
+    transport: &'static str,
+    notes: &'static str,
+    started: Instant,
+    handles: Vec<tokio::task::JoinHandle<Vec<Duration>>>,
+) -> BenchResult {
+    let mut samples = Vec::new();
+    for handle in handles {
+        samples.extend(handle.await.expect("benchmark worker should finish"));
+    }
+    summarize(name, transport, notes, samples, started.elapsed(), 0)
 }
 
 async fn assert_native_batch_hits(client: &mut NativeClient, keys: &[Vec<u8>]) {
