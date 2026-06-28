@@ -75,6 +75,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ]
     );
 
+    let pipelined = client
+        .request_pipelined(vec![
+            (
+                cachebox::protocol::Command::Get,
+                cachebox::protocol::RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"user:123".to_vec(),
+                },
+            ),
+            (
+                cachebox::protocol::Command::Get,
+                cachebox::protocol::RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"missing".to_vec(),
+                },
+            ),
+        ])
+        .await?;
+    assert_eq!(
+        pipelined,
+        vec![
+            ResponsePayload::Hit(b"cached bytes".to_vec()),
+            ResponsePayload::Miss,
+        ]
+    );
+
     let lease = client
         .start_lease("default", b"expensive".to_vec(), 10_000, None)
         .await?;

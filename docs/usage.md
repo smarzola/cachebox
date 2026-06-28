@@ -8,7 +8,7 @@ All examples use:
 ```rust
 use cachebox::api::Ttl;
 use cachebox::client::NativeClient;
-use cachebox::protocol::{BatchItem, Metadata, ResponsePayload};
+use cachebox::protocol::{BatchItem, Command, Metadata, RequestPayload, ResponsePayload};
 ```
 
 Connect over the default native TCP listener:
@@ -164,6 +164,52 @@ for item in items {
 ```
 
 Each item reports hit, stale, or miss state.
+
+## Pipelined Requests
+
+Use `request_pipelined` when you want to send multiple independent native
+requests before waiting for responses. The helper matches responses by request
+id and returns payloads in the same order as the submitted requests:
+
+```rust
+let responses = client
+    .request_pipelined(vec![
+        (
+            Command::Get,
+            RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"a".to_vec(),
+            },
+        ),
+        (
+            Command::Get,
+            RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"user:123".to_vec(),
+            },
+        ),
+    ])
+    .await?;
+
+for response in responses {
+    match response {
+        ResponsePayload::Hit(bytes) => {
+            let _ = bytes;
+        }
+        ResponsePayload::Stale(bytes) => {
+            let _ = bytes;
+        }
+        ResponsePayload::Miss => {}
+        other => {
+            let _ = other;
+        }
+    }
+}
+```
+
+If any pipelined request returns a structured server error, the helper returns
+`ClientError::Server` after reading the response batch so the connection remains
+usable.
 
 ## Tags
 

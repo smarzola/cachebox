@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use cachebox::api::{ContentType, Ttl};
 use cachebox::client::{ClientError, NativeClient};
-use cachebox::protocol::{BatchItem, Metadata, ResponsePayload};
+use cachebox::protocol::{
+    BatchItem, Command as NativeCommand, Metadata, RequestPayload, ResponsePayload,
+};
 
 struct ServerProcess {
     child: Child,
@@ -95,6 +97,32 @@ async fn native_client_workflow(mut client: NativeClient) {
         ]
     );
 
+    assert_eq!(
+        client
+            .request_pipelined(vec![
+                (
+                    NativeCommand::Get,
+                    RequestPayload::Get {
+                        namespace: "default".to_string(),
+                        key: b"blob".to_vec(),
+                    },
+                ),
+                (
+                    NativeCommand::Get,
+                    RequestPayload::Get {
+                        namespace: "default".to_string(),
+                        key: b"missing".to_vec(),
+                    },
+                ),
+            ])
+            .await
+            .expect("native pipelined get"),
+        vec![
+            ResponsePayload::Hit(vec![0, 255, b'v', b'a', b'l']),
+            ResponsePayload::Miss,
+        ]
+    );
+
     let lease = client
         .start_lease("default", b"leased".to_vec(), 10_000, None)
         .await
@@ -158,6 +186,33 @@ async fn native_client_workflow(mut client: NativeClient) {
         error,
         ClientError::Server {
             code: cachebox::protocol::ErrorCode::ValueTooLarge,
+            ..
+        }
+    ));
+
+    let error = client
+        .request_pipelined(vec![
+            (
+                NativeCommand::Get,
+                RequestPayload::Get {
+                    namespace: "bad namespace!".to_string(),
+                    key: b"k".to_vec(),
+                },
+            ),
+            (
+                NativeCommand::Get,
+                RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"missing".to_vec(),
+                },
+            ),
+        ])
+        .await
+        .expect_err("pipelined server error should fail");
+    assert!(matches!(
+        error,
+        ClientError::Server {
+            code: cachebox::protocol::ErrorCode::InvalidNamespace,
             ..
         }
     ));

@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cachebox::api::Ttl;
+use cachebox::client::NativeClient as OfficialNativeClient;
 use cachebox::config::Config;
 use cachebox::engine::{Engine, GetOutcome, GetOutcomeRef, PutCommand, ShardedEngine};
 use cachebox::protocol::{
@@ -61,6 +62,9 @@ fn main() {
 async fn async_main() {
     let native_server = NativeLoopbackServer::start(Config::default());
     let mut native_client = NativeClient::connect_tcp(&native_server.addr).await;
+    let mut official_client = OfficialNativeClient::connect_tcp(&native_server.addr)
+        .await
+        .expect("official native tcp client");
 
     let mut scenarios = vec![
         bench_engine_get(),
@@ -82,6 +86,8 @@ async fn async_main() {
         bench_native_tag_invalidation(&mut native_client).await,
         bench_native_ttl_heavy_writes(&mut native_client).await,
         bench_native_pipelined_get(&mut native_client).await,
+        bench_official_sequential_get_32(&mut official_client, "loopback_tcp").await,
+        bench_official_pipelined_get_32(&mut official_client, "loopback_tcp").await,
         bench_native_concurrent_get_tcp(&native_server.addr).await,
         bench_native_concurrent_get_distinct_tcp(&native_server.addr).await,
         bench_native_concurrent_put_tcp(&native_server.addr).await,
@@ -92,6 +98,9 @@ async fn async_main() {
     {
         let native_unix_server = NativeUnixLoopbackServer::start(Config::default());
         let mut native_unix_client = NativeClient::connect_unix(&native_unix_server.path).await;
+        let mut official_unix_client = OfficialNativeClient::connect_unix(&native_unix_server.path)
+            .await
+            .expect("official native unix client");
         scenarios.extend([
             bench_native_single_key_get(&mut native_unix_client).await,
             bench_native_single_key_put(&mut native_unix_client).await,
@@ -102,6 +111,8 @@ async fn async_main() {
             bench_native_tag_invalidation(&mut native_unix_client).await,
             bench_native_ttl_heavy_writes(&mut native_unix_client).await,
             bench_native_pipelined_get(&mut native_unix_client).await,
+            bench_official_sequential_get_32(&mut official_unix_client, "loopback_unix").await,
+            bench_official_pipelined_get_32(&mut official_unix_client, "loopback_unix").await,
             bench_native_concurrent_get_unix(&native_unix_server.path).await,
             bench_native_concurrent_get_distinct_unix(&native_unix_server.path).await,
             bench_native_concurrent_put_unix(&native_unix_server.path).await,
@@ -697,6 +708,110 @@ async fn native_pipelined_get_round(client: &mut NativeClient) {
         assert_eq!(response.payload, ResponsePayload::Hit(b"value".to_vec()));
     }
     assert!(seen.into_iter().all(|seen| seen));
+}
+
+async fn bench_official_sequential_get_32(
+    client: &mut OfficialNativeClient,
+    transport: &'static str,
+) -> BenchResult {
+    client
+        .put(
+            "default",
+            b"official-sequential-get-key".to_vec(),
+            Metadata::default(),
+            b"value".to_vec(),
+        )
+        .await
+        .expect("official put");
+    warmup_async!({
+        official_sequential_get_32_round(client, b"official-sequential-get-key").await;
+    });
+
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let sample_started = Instant::now();
+        official_sequential_get_32_round(client, b"official-sequential-get-key").await;
+        let per_request = sample_started.elapsed() / PIPELINE_DEPTH as u32;
+        samples.extend(std::iter::repeat_n(per_request, PIPELINE_DEPTH));
+    }
+    summarize(
+        "client_sequential_get_32",
+        transport,
+        "official_client_32_sequential_gets",
+        samples,
+        started.elapsed(),
+        0,
+    )
+}
+
+async fn official_sequential_get_32_round(client: &mut OfficialNativeClient, key: &[u8]) {
+    for _ in 0..PIPELINE_DEPTH {
+        assert_eq!(
+            client
+                .get("default", key.to_vec())
+                .await
+                .expect("official sequential get"),
+            ResponsePayload::Hit(b"value".to_vec())
+        );
+    }
+}
+
+async fn bench_official_pipelined_get_32(
+    client: &mut OfficialNativeClient,
+    transport: &'static str,
+) -> BenchResult {
+    client
+        .put(
+            "default",
+            b"official-pipelined-get-key".to_vec(),
+            Metadata::default(),
+            b"value".to_vec(),
+        )
+        .await
+        .expect("official put");
+    warmup_async!({
+        official_pipelined_get_32_round(client, b"official-pipelined-get-key").await;
+    });
+
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < MEASURE_DURATION {
+        let sample_started = Instant::now();
+        official_pipelined_get_32_round(client, b"official-pipelined-get-key").await;
+        let per_request = sample_started.elapsed() / PIPELINE_DEPTH as u32;
+        samples.extend(std::iter::repeat_n(per_request, PIPELINE_DEPTH));
+    }
+    summarize(
+        "client_pipelined_get_32",
+        transport,
+        "official_client_32_pipelined_gets",
+        samples,
+        started.elapsed(),
+        0,
+    )
+}
+
+async fn official_pipelined_get_32_round(client: &mut OfficialNativeClient, key: &[u8]) {
+    let requests = (0..PIPELINE_DEPTH)
+        .map(|_| {
+            (
+                Command::Get,
+                RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: key.to_vec(),
+                },
+            )
+        })
+        .collect();
+    let responses = client
+        .request_pipelined(requests)
+        .await
+        .expect("official pipelined get");
+    assert_eq!(responses.len(), PIPELINE_DEPTH);
+    for response in responses {
+        assert_eq!(response, ResponsePayload::Hit(b"value".to_vec()));
+    }
 }
 
 async fn bench_native_concurrent_get_tcp(addr: &str) -> BenchResult {
