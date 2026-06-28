@@ -1,0 +1,348 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "name": "get_request",
+      "direction": "request",
+      "command": "Get",
+      "request_id": 1,
+      "hex": "4342583101000100000000000000000100000017000000000000000764656661756c7400000008757365723a313233",
+      "summary": {
+        "namespace": "default",
+        "key": "user:123"
+      }
+    },
+    {
+      "name": "put_request_default_metadata",
+      "direction": "request",
+      "command": "Put",
+      "request_id": 2,
+      "hex": "4342583101000200000000000000000200000037000000000000000764656661756c7400000003726177000000000000000000000000000000000000000000000000000000000000000576616c7565",
+      "summary": {
+        "namespace": "default",
+        "key": "raw",
+        "metadata": "default",
+        "value": "value"
+      }
+    },
+    {
+      "name": "put_request_full_metadata",
+      "direction": "request",
+      "command": "Put",
+      "request_id": 3,
+      "hex": "434258310100020000000000000000030000005b000000000000000764656661756c740000000461693a3100000000000493e0000000000000ea6001000000000000002a000200000008757365723a3132330000001270726f6d70742f74656d706c6174652f76320100000006636163686564",
+      "summary": {
+        "namespace": "default",
+        "key": "ai:1",
+        "ttl_ms": 300000,
+        "stale_ttl_ms": 60000,
+        "cost": 42,
+        "tags": [
+          "user:123",
+          "prompt/template/v2"
+        ],
+        "content_type": "other"
+      }
+    },
+    {
+      "name": "delete_request",
+      "direction": "request",
+      "command": "Delete",
+      "request_id": 4,
+      "hex": "4342583101000300000000000000000400000012000000000000000764656661756c7400000003726177",
+      "summary": {
+        "namespace": "default",
+        "key": "raw"
+      }
+    },
+    {
+      "name": "batch_get_request",
+      "direction": "request",
+      "command": "BatchGet",
+      "request_id": 5,
+      "hex": "4342583101000400000000000000000500000019000000000000000764656661756c740000000200000001610000000162",
+      "summary": {
+        "namespace": "default",
+        "keys": [
+          "a",
+          "b"
+        ]
+      }
+    },
+    {
+      "name": "tag_invalidate_request",
+      "direction": "request",
+      "command": "TagInvalidate",
+      "request_id": 6,
+      "hex": "434258310100050000000000000000060000001f000000000000000764656661756c7400000010757365723a3132332f70726f66696c65",
+      "summary": {
+        "namespace": "default",
+        "tag": "user:123/profile"
+      }
+    },
+    {
+      "name": "lease_start_request",
+      "direction": "request",
+      "command": "LeaseStart",
+      "request_id": 7,
+      "hex": "4342583101000600000000000000000700000022000000000000000764656661756c7400000003686f7400000000000075300000000000000000",
+      "summary": {
+        "namespace": "default",
+        "key": "hot",
+        "lease_ttl_ms": 30000,
+        "allow_stale_ms": null
+      }
+    },
+    {
+      "name": "lease_start_request_allow_stale",
+      "direction": "request",
+      "command": "LeaseStart",
+      "request_id": 8,
+      "hex": "4342583101000600000000000000000800000022000000000000000764656661756c7400000003686f7400000000000075300000000000001388",
+      "summary": {
+        "namespace": "default",
+        "key": "hot",
+        "lease_ttl_ms": 30000,
+        "allow_stale_ms": 5000,
+        "server_note": "currently parsed but ignored"
+      }
+    },
+    {
+      "name": "lease_complete_request",
+      "direction": "request",
+      "command": "LeaseComplete",
+      "request_id": 9,
+      "hex": "4342583101000700000000000000000900000049000000000000000764656661756c7400000003686f74000000076c656173652d3100000000000493e0000000000000ea60000000000000000000000100000003686f7400000000056672657368",
+      "summary": {
+        "namespace": "default",
+        "key": "hot",
+        "lease_token": "lease-1",
+        "ttl_ms": 300000,
+        "stale_ttl_ms": 60000,
+        "tags": [
+          "hot"
+        ],
+        "value": "fresh"
+      }
+    },
+    {
+      "name": "hit_response",
+      "direction": "response",
+      "command": "Get",
+      "request_id": 101,
+      "hex": "434258310101010000000000000000650000000a00000000010000000576616c7565",
+      "summary": {
+        "state": "hit",
+        "value": "value"
+      }
+    },
+    {
+      "name": "stale_response",
+      "direction": "response",
+      "command": "Get",
+      "request_id": 102,
+      "hex": "43425831010101000000000000000066000000080000000002000000036f6c64",
+      "summary": {
+        "state": "stale",
+        "value": "old"
+      }
+    },
+    {
+      "name": "miss_response",
+      "direction": "response",
+      "command": "Get",
+      "request_id": 103,
+      "hex": "43425831010101000000000000000067000000010000000003",
+      "summary": {
+        "state": "miss"
+      }
+    },
+    {
+      "name": "stored_response",
+      "direction": "response",
+      "command": "Put",
+      "request_id": 104,
+      "hex": "4342583101010200000000000000006800000005000000000400000002",
+      "summary": {
+        "state": "stored",
+        "evicted": 2
+      }
+    },
+    {
+      "name": "deleted_response_true",
+      "direction": "response",
+      "command": "Delete",
+      "request_id": 105,
+      "hex": "4342583101010300000000000000006900000002000000000501",
+      "summary": {
+        "state": "deleted",
+        "removed": true
+      }
+    },
+    {
+      "name": "deleted_response_false",
+      "direction": "response",
+      "command": "Delete",
+      "request_id": 106,
+      "hex": "4342583101010300000000000000006a00000002000000000500",
+      "summary": {
+        "state": "deleted",
+        "removed": false
+      }
+    },
+    {
+      "name": "invalidated_response",
+      "direction": "response",
+      "command": "TagInvalidate",
+      "request_id": 107,
+      "hex": "4342583101010500000000000000006b00000005000000000600000003",
+      "summary": {
+        "state": "invalidated",
+        "removed": 3
+      }
+    },
+    {
+      "name": "batch_get_response",
+      "direction": "response",
+      "command": "BatchGet",
+      "request_id": 108,
+      "hex": "4342583101010400000000000000006c0000001e0000000000000000030100000007612d76616c75650200000007622d7374616c6503",
+      "summary": {
+        "items": [
+          "hit",
+          "stale",
+          "miss"
+        ]
+      }
+    },
+    {
+      "name": "lease_granted_response_empty",
+      "direction": "response",
+      "command": "LeaseStart",
+      "request_id": 109,
+      "hex": "4342583101010600000000000000006d0000000d0000000007000000076c656173652d3100",
+      "summary": {
+        "state": "lease_granted",
+        "stale_value": null
+      }
+    },
+    {
+      "name": "lease_granted_response_stale",
+      "direction": "response",
+      "command": "LeaseStart",
+      "request_id": 110,
+      "hex": "4342583101010600000000000000006e000000140000000007000000076c656173652d3201000000036f6c64",
+      "summary": {
+        "state": "lease_granted",
+        "stale_value": "old"
+      }
+    },
+    {
+      "name": "lease_denied_response",
+      "direction": "response",
+      "command": "LeaseStart",
+      "request_id": 111,
+      "hex": "4342583101010600000000000000006f000000010000000008",
+      "summary": {
+        "state": "lease_denied"
+      }
+    },
+    {
+      "name": "error_response",
+      "direction": "response",
+      "command": "Get",
+      "request_id": 112,
+      "hex": "434258310101010000000000000000700000001800000000ff000400000011696e76616c6964206e616d657370616365",
+      "summary": {
+        "state": "error",
+        "code": "InvalidNamespace"
+      }
+    },
+    {
+      "name": "bad_magic",
+      "direction": "malformed_request",
+      "expected_error": "BadMagic",
+      "hex": "584258310100010000000000000000c900000010000000000000000764656661756c74000000016b"
+    },
+    {
+      "name": "unsupported_version",
+      "direction": "malformed_request",
+      "expected_error": "UnsupportedVersion",
+      "hex": "434258310200010000000000000000c900000010000000000000000764656661756c74000000016b"
+    },
+    {
+      "name": "response_kind_for_request",
+      "direction": "malformed_request",
+      "expected_error": "InvalidKind",
+      "hex": "434258310101010000000000000000c900000010000000000000000764656661756c74000000016b"
+    },
+    {
+      "name": "unknown_command",
+      "direction": "malformed_request",
+      "expected_error": "UnknownCommand",
+      "hex": "4342583101007f0000000000000000c900000010000000000000000764656661756c74000000016b"
+    },
+    {
+      "name": "nonzero_flags",
+      "direction": "malformed_request",
+      "expected_error": "NonzeroFlags",
+      "hex": "434258310100010100000000000000c900000010000000000000000764656661756c74000000016b"
+    },
+    {
+      "name": "nonzero_reserved",
+      "direction": "malformed_request",
+      "expected_error": "NonzeroReserved",
+      "hex": "434258310100010000000000000000c900000010000000010000000764656661756c74000000016b"
+    },
+    {
+      "name": "oversized_payload_len",
+      "direction": "malformed_request",
+      "expected_error": "FrameTooLarge",
+      "hex": "434258310100010000000000000000c900000800000000000000000764656661756c74000000016b"
+    },
+    {
+      "name": "trailing_payload_bytes",
+      "direction": "malformed_request",
+      "expected_error": "TrailingBytes",
+      "hex": "434258310100010000000000000000c900000011000000000000000764656661756c74000000016b00"
+    },
+    {
+      "name": "invalid_namespace",
+      "direction": "malformed_request",
+      "expected_error": "InvalidNamespace",
+      "hex": "434258310100010000000000000000ca00000016000000000000000d626164206e616d657370616365000000016b"
+    },
+    {
+      "name": "invalid_tag",
+      "direction": "malformed_request",
+      "expected_error": "InvalidTag",
+      "hex": "434258310100050000000000000000cb00000017000000000000000764656661756c74000000086261642074616721"
+    },
+    {
+      "name": "invalid_bool_response",
+      "direction": "malformed_response",
+      "command": "Delete",
+      "request_id": 204,
+      "expected_error": "InvalidBool",
+      "hex": "434258310101030000000000000000cc00000002000000000502"
+    },
+    {
+      "name": "empty_batch_get",
+      "direction": "malformed_request",
+      "expected_error": "InvalidPayload",
+      "hex": "434258310100040000000000000000cd0000000f000000000000000764656661756c7400000000"
+    },
+    {
+      "name": "zero_lease_ttl",
+      "direction": "malformed_request",
+      "expected_error": "InvalidPayload",
+      "hex": "434258310100060000000000000000ce00000020000000000000000764656661756c74000000016b00000000000000000000000000000000"
+    },
+    {
+      "name": "empty_lease_token",
+      "direction": "malformed_request",
+      "expected_error": "InvalidPayload",
+      "hex": "434258310100070000000000000000cf00000039000000000000000764656661756c74000000016b00000000000000000000000000000000000000000000000000000000000000000000000576616c7565"
+    }
+  ]
+}

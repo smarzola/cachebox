@@ -978,8 +978,10 @@ fn write_string(out: &mut Vec<u8>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     const MAX_PAYLOAD: usize = 1024;
+    const SHARED_FIXTURES: &str = include_str!("../../../fixtures/native-protocol/v1/frames.json");
 
     fn round_trip(payload: RequestPayload) -> RequestFrame {
         let command = command_for_payload(&payload);
@@ -1216,6 +1218,61 @@ mod tests {
     }
 
     #[test]
+    fn shared_fixture_file_matches_codec() {
+        let document: Value =
+            serde_json::from_str(SHARED_FIXTURES).expect("fixture file should be valid JSON");
+        assert_eq!(document["version"].as_u64(), Some(1));
+        let fixtures = document["fixtures"]
+            .as_array()
+            .expect("fixtures should be an array");
+
+        for fixture in fixtures {
+            let name = fixture["name"].as_str().expect("fixture name");
+            let direction = fixture["direction"].as_str().expect("fixture direction");
+            let bytes = fixture_bytes(fixture);
+            match direction {
+                "request" => {
+                    let expected = expected_request_fixture(name);
+                    assert_eq!(encode_request_frame(&expected), bytes, "{name}");
+                    assert_eq!(
+                        decode_request_frame(&bytes, MAX_PAYLOAD).expect("fixture request"),
+                        expected,
+                        "{name}"
+                    );
+                }
+                "response" => {
+                    let expected = expected_response_fixture(name);
+                    assert_eq!(encode_response_frame(&expected), bytes, "{name}");
+                    assert_eq!(
+                        decode_response_frame(&bytes, MAX_PAYLOAD).expect("fixture response"),
+                        expected,
+                        "{name}"
+                    );
+                }
+                "malformed_request" => {
+                    let error =
+                        decode_request_frame(&bytes, MAX_PAYLOAD).expect_err("malformed request");
+                    assert_eq!(
+                        decode_error_name(&error),
+                        fixture["expected_error"].as_str().expect("expected error"),
+                        "{name}: {error:?}"
+                    );
+                }
+                "malformed_response" => {
+                    let error =
+                        decode_response_frame(&bytes, MAX_PAYLOAD).expect_err("malformed response");
+                    assert_eq!(
+                        decode_error_name(&error),
+                        fixture["expected_error"].as_str().expect("expected error"),
+                        "{name}: {error:?}"
+                    );
+                }
+                other => panic!("unknown fixture direction {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn encodes_borrowed_response_payload_view() {
         let mut buffer = Vec::new();
         encode_response_payload_view_frame_into(
@@ -1423,5 +1480,224 @@ mod tests {
             }),
             DecodeError::InvalidTag
         );
+    }
+
+    fn fixture_bytes(fixture: &Value) -> Vec<u8> {
+        let hex = fixture["hex"].as_str().expect("fixture hex");
+        assert_eq!(hex.len() % 2, 0, "hex fixture should be byte aligned");
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex byte"))
+            .collect()
+    }
+
+    fn expected_request_fixture(name: &str) -> RequestFrame {
+        match name {
+            "get_request" => RequestFrame {
+                request_id: 1,
+                command: Command::Get,
+                payload: RequestPayload::Get {
+                    namespace: "default".to_string(),
+                    key: b"user:123".to_vec(),
+                },
+            },
+            "put_request_default_metadata" => RequestFrame {
+                request_id: 2,
+                command: Command::Put,
+                payload: RequestPayload::Put {
+                    namespace: "default".to_string(),
+                    key: b"raw".to_vec(),
+                    metadata: Metadata::default(),
+                    value: b"value".to_vec(),
+                },
+            },
+            "put_request_full_metadata" => RequestFrame {
+                request_id: 3,
+                command: Command::Put,
+                payload: RequestPayload::Put {
+                    namespace: "default".to_string(),
+                    key: b"ai:1".to_vec(),
+                    metadata: Metadata {
+                        ttl: Some(Ttl {
+                            milliseconds: 300_000,
+                        }),
+                        stale_ttl: Some(Ttl {
+                            milliseconds: 60_000,
+                        }),
+                        cost: Some(42),
+                        tags: vec!["user:123".to_string(), "prompt/template/v2".to_string()],
+                        content_type: ContentType::Other,
+                    },
+                    value: b"cached".to_vec(),
+                },
+            },
+            "delete_request" => RequestFrame {
+                request_id: 4,
+                command: Command::Delete,
+                payload: RequestPayload::Delete {
+                    namespace: "default".to_string(),
+                    key: b"raw".to_vec(),
+                },
+            },
+            "batch_get_request" => RequestFrame {
+                request_id: 5,
+                command: Command::BatchGet,
+                payload: RequestPayload::BatchGet {
+                    namespace: "default".to_string(),
+                    keys: vec![b"a".to_vec(), b"b".to_vec()],
+                },
+            },
+            "tag_invalidate_request" => RequestFrame {
+                request_id: 6,
+                command: Command::TagInvalidate,
+                payload: RequestPayload::TagInvalidate {
+                    namespace: "default".to_string(),
+                    tag: "user:123/profile".to_string(),
+                },
+            },
+            "lease_start_request" => RequestFrame {
+                request_id: 7,
+                command: Command::LeaseStart,
+                payload: RequestPayload::LeaseStart {
+                    namespace: "default".to_string(),
+                    key: b"hot".to_vec(),
+                    lease_ttl_ms: 30_000,
+                    allow_stale_ms: None,
+                },
+            },
+            "lease_start_request_allow_stale" => RequestFrame {
+                request_id: 8,
+                command: Command::LeaseStart,
+                payload: RequestPayload::LeaseStart {
+                    namespace: "default".to_string(),
+                    key: b"hot".to_vec(),
+                    lease_ttl_ms: 30_000,
+                    allow_stale_ms: Some(5_000),
+                },
+            },
+            "lease_complete_request" => RequestFrame {
+                request_id: 9,
+                command: Command::LeaseComplete,
+                payload: RequestPayload::LeaseComplete {
+                    namespace: "default".to_string(),
+                    key: b"hot".to_vec(),
+                    lease_token: "lease-1".to_string(),
+                    metadata: Metadata {
+                        ttl: Some(Ttl {
+                            milliseconds: 300_000,
+                        }),
+                        stale_ttl: Some(Ttl {
+                            milliseconds: 60_000,
+                        }),
+                        cost: None,
+                        tags: vec!["hot".to_string()],
+                        content_type: ContentType::OctetStream,
+                    },
+                    value: b"fresh".to_vec(),
+                },
+            },
+            other => panic!("unknown request fixture {other:?}"),
+        }
+    }
+
+    fn expected_response_fixture(name: &str) -> ResponseFrame {
+        match name {
+            "hit_response" => ResponseFrame {
+                request_id: 101,
+                command: Command::Get,
+                payload: ResponsePayload::Hit(b"value".to_vec()),
+            },
+            "stale_response" => ResponseFrame {
+                request_id: 102,
+                command: Command::Get,
+                payload: ResponsePayload::Stale(b"old".to_vec()),
+            },
+            "miss_response" => ResponseFrame {
+                request_id: 103,
+                command: Command::Get,
+                payload: ResponsePayload::Miss,
+            },
+            "stored_response" => ResponseFrame {
+                request_id: 104,
+                command: Command::Put,
+                payload: ResponsePayload::Stored { evicted: 2 },
+            },
+            "deleted_response_true" => ResponseFrame {
+                request_id: 105,
+                command: Command::Delete,
+                payload: ResponsePayload::Deleted { removed: true },
+            },
+            "deleted_response_false" => ResponseFrame {
+                request_id: 106,
+                command: Command::Delete,
+                payload: ResponsePayload::Deleted { removed: false },
+            },
+            "invalidated_response" => ResponseFrame {
+                request_id: 107,
+                command: Command::TagInvalidate,
+                payload: ResponsePayload::Invalidated { removed: 3 },
+            },
+            "batch_get_response" => ResponseFrame {
+                request_id: 108,
+                command: Command::BatchGet,
+                payload: ResponsePayload::BatchGet {
+                    items: vec![
+                        BatchItem::Hit(b"a-value".to_vec()),
+                        BatchItem::Stale(b"b-stale".to_vec()),
+                        BatchItem::Miss,
+                    ],
+                },
+            },
+            "lease_granted_response_empty" => ResponseFrame {
+                request_id: 109,
+                command: Command::LeaseStart,
+                payload: ResponsePayload::LeaseGranted {
+                    lease_token: "lease-1".to_string(),
+                    stale_value: None,
+                },
+            },
+            "lease_granted_response_stale" => ResponseFrame {
+                request_id: 110,
+                command: Command::LeaseStart,
+                payload: ResponsePayload::LeaseGranted {
+                    lease_token: "lease-2".to_string(),
+                    stale_value: Some(b"old".to_vec()),
+                },
+            },
+            "lease_denied_response" => ResponseFrame {
+                request_id: 111,
+                command: Command::LeaseStart,
+                payload: ResponsePayload::LeaseDenied,
+            },
+            "error_response" => ResponseFrame {
+                request_id: 112,
+                command: Command::Get,
+                payload: ResponsePayload::Error {
+                    code: ErrorCode::InvalidNamespace,
+                    message: "invalid namespace".to_string(),
+                },
+            },
+            other => panic!("unknown response fixture {other:?}"),
+        }
+    }
+
+    fn decode_error_name(error: &DecodeError) -> &'static str {
+        match error {
+            DecodeError::IncompleteHeader => "IncompleteHeader",
+            DecodeError::BadMagic => "BadMagic",
+            DecodeError::UnsupportedVersion(_) => "UnsupportedVersion",
+            DecodeError::InvalidKind(_) => "InvalidKind",
+            DecodeError::UnknownCommand(_) => "UnknownCommand",
+            DecodeError::NonzeroFlags(_) => "NonzeroFlags",
+            DecodeError::NonzeroReserved(_) => "NonzeroReserved",
+            DecodeError::FrameTooLarge { .. } => "FrameTooLarge",
+            DecodeError::TruncatedPayload { .. } => "TruncatedPayload",
+            DecodeError::InvalidPayload(_) => "InvalidPayload",
+            DecodeError::InvalidUtf8 => "InvalidUtf8",
+            DecodeError::InvalidNamespace => "InvalidNamespace",
+            DecodeError::InvalidTag => "InvalidTag",
+            DecodeError::InvalidBool(_) => "InvalidBool",
+            DecodeError::TrailingBytes(_) => "TrailingBytes",
+        }
     }
 }
