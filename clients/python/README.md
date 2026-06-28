@@ -8,8 +8,7 @@ distributions without requiring a Rust toolchain.
 The current package includes a pure Python native protocol codec, synchronous
 socket client, asyncio client, optional sync/async connection pools,
 serializer helpers, deterministic key builders, and high-level sync/async
-caching APIs. Dogpile protection is implemented in a follow-up native Python
-milestone.
+caching APIs with lease-backed dogpile protection.
 
 ## Local Development
 
@@ -57,6 +56,16 @@ async with await AsyncCachebox.connect_tcp(
     result = await cache.get("user:789")
     assert result == {"id": 789}
 ```
+
+`get_or_set`, `memoize`, and `cached` use Cachebox leases by default so
+concurrent misses do not stampede the origin. The caller that receives the
+lease computes and completes it; callers denied a lease wait and retry until a
+cached value appears or the dogpile wait timeout expires. If a stale value is
+available while another caller holds a refresh lease, it is returned by
+default. A caller that receives a refresh lease computes and stores the new
+value; if that refresh raises and the server supplied a stale value, the stale
+value is returned by default. Cachebox currently has no lease-abort command, so
+failed refresh leases expire according to `lease_ttl_ms`.
 
 Low-level clients and high-level cache APIs build on explicit serializers and
 deterministic keys:

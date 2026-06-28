@@ -13,7 +13,14 @@ from .client import (
     ServerError,
     UnexpectedResponse,
 )
-from .cache import AsyncCachebox, CacheBackend, AsyncCacheBackend, Cachebox
+from .cache import (
+    AsyncCacheBackend,
+    AsyncCachebox,
+    CacheBackend,
+    Cachebox,
+    DogpilePolicy,
+    DogpileTimeoutError,
+)
 from .keys import (
     KeyBuildError,
     KeyOptions,
@@ -51,6 +58,8 @@ __all__ = [
     "CacheBackend",
     "Cachebox",
     "DecodeError",
+    "DogpilePolicy",
+    "DogpileTimeoutError",
     "EncodeError",
     "JsonSerializer",
     "KeyBuildError",

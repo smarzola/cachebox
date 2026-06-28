@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import random
+import time
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Protocol, TypeVar
 
@@ -35,6 +39,25 @@ class CacheBackend(Protocol):
     def invalidate_tag(self, namespace: str, tag: str) -> int:
         ...
 
+    def start_lease(
+        self,
+        namespace: str,
+        key: bytes,
+        lease_ttl_ms: int,
+        allow_stale_ms: int | None = None,
+    ) -> protocol.Hit | protocol.Stale | protocol.LeaseGranted | protocol.LeaseDenied:
+        ...
+
+    def complete_lease(
+        self,
+        namespace: str,
+        key: bytes,
+        lease_token: str,
+        value: bytes,
+        metadata: protocol.Metadata | None = None,
+    ) -> int:
+        ...
+
 
 class AsyncCacheBackend(Protocol):
     async def get(self, namespace: str, key: bytes) -> protocol.Hit | protocol.Stale | protocol.Miss:
@@ -55,6 +78,43 @@ class AsyncCacheBackend(Protocol):
     async def invalidate_tag(self, namespace: str, tag: str) -> int:
         ...
 
+    async def start_lease(
+        self,
+        namespace: str,
+        key: bytes,
+        lease_ttl_ms: int,
+        allow_stale_ms: int | None = None,
+    ) -> protocol.Hit | protocol.Stale | protocol.LeaseGranted | protocol.LeaseDenied:
+        ...
+
+    async def complete_lease(
+        self,
+        namespace: str,
+        key: bytes,
+        lease_token: str,
+        value: bytes,
+        metadata: protocol.Metadata | None = None,
+    ) -> int:
+        ...
+
+
+@dataclass(frozen=True)
+class DogpilePolicy:
+    """Lease-backed stampede protection policy."""
+
+    enabled: bool = True
+    lease_ttl_ms: int = 30_000
+    allow_stale_ms: int | None = None
+    return_stale: bool = True
+    wait_timeout_ms: int = 5_000
+    retry_interval_ms: int = 25
+    retry_jitter_ms: int = 25
+    return_stale_on_error: bool = True
+
+
+class DogpileTimeoutError(Exception):
+    """A cache fill was still leased by another caller after waiting."""
+
 
 class Cachebox:
     """Synchronous high-level Cachebox cache API."""
@@ -67,12 +127,14 @@ class Cachebox:
         serializer: Serializer | None = None,
         key_prefix: str | None = None,
         key_version: str | int | None = None,
+        dogpile: DogpilePolicy | None = None,
     ) -> None:
         self._client = client
         self.namespace = namespace
         self.serializer = serializer or BytesSerializer()
         self.key_prefix = key_prefix
         self.key_version = key_version
+        self.dogpile = dogpile or DogpilePolicy()
 
     @classmethod
     def connect_tcp(
@@ -83,6 +145,7 @@ class Cachebox:
         serializer: Serializer | None = None,
         key_prefix: str | None = None,
         key_version: str | int | None = None,
+        dogpile: DogpilePolicy | None = None,
         pool_size: int | None = None,
         timeout: float | None = None,
         acquire_timeout: float | None = None,
@@ -103,6 +166,7 @@ class Cachebox:
             serializer=serializer,
             key_prefix=key_prefix,
             key_version=key_version,
+            dogpile=dogpile,
         )
 
     def close(self) -> None:
@@ -172,6 +236,7 @@ class Cachebox:
         cost: int | None = None,
         serializer: Serializer | None = None,
         namespace: str | None = None,
+        dogpile: DogpilePolicy | bool | None = None,
     ) -> Any:
         return self._get_or_set_keyed(
             self.key(key),
@@ -182,6 +247,7 @@ class Cachebox:
             cost=cost,
             serializer=serializer,
             namespace=namespace,
+            dogpile=dogpile,
         )
 
     def _get_or_set_keyed(
@@ -195,7 +261,22 @@ class Cachebox:
         cost: int | None = None,
         serializer: Serializer | None = None,
         namespace: str | None = None,
+        dogpile: DogpilePolicy | bool | None = None,
     ) -> Any:
+        policy = _resolve_dogpile(self.dogpile, dogpile)
+        if policy.enabled:
+            return self._get_or_set_keyed_with_lease(
+                key,
+                factory,
+                ttl_ms=ttl_ms,
+                stale_ttl_ms=stale_ttl_ms,
+                tags=tags,
+                cost=cost,
+                serializer=serializer,
+                namespace=namespace,
+                policy=policy,
+            )
+
         cached = self._get_keyed(
             key,
             default=_MISSING,
@@ -216,6 +297,65 @@ class Cachebox:
             namespace=namespace,
         )
         return value
+
+    def _get_or_set_keyed_with_lease(
+        self,
+        key: bytes,
+        factory: Callable[[], Any],
+        *,
+        ttl_ms: int | None = None,
+        stale_ttl_ms: int | None = None,
+        tags: Sequence[str] = (),
+        cost: int | None = None,
+        serializer: Serializer | None = None,
+        namespace: str | None = None,
+        policy: DogpilePolicy,
+    ) -> Any:
+        selected = serializer or self.serializer
+        resolved_namespace = namespace or self.namespace
+        deadline = _deadline(policy.wait_timeout_ms)
+
+        while True:
+            outcome = self._client.start_lease(
+                resolved_namespace,
+                key,
+                policy.lease_ttl_ms,
+                policy.allow_stale_ms,
+            )
+            if isinstance(outcome, protocol.Hit):
+                return selected.decode(outcome.value)
+            if isinstance(outcome, protocol.Stale):
+                if policy.return_stale:
+                    return selected.decode(outcome.value)
+                if _timed_out(deadline):
+                    raise DogpileTimeoutError("timed out waiting for fresh cache value")
+                _sleep_retry(policy)
+                continue
+            if isinstance(outcome, protocol.LeaseGranted):
+                try:
+                    value = factory()
+                except Exception:
+                    if outcome.stale_value is not None and policy.return_stale_on_error:
+                        return selected.decode(outcome.stale_value)
+                    raise
+                encoded = selected.encode(value)
+                self._client.complete_lease(
+                    resolved_namespace,
+                    key,
+                    outcome.lease_token,
+                    encoded,
+                    make_metadata(
+                        ttl_ms=ttl_ms,
+                        stale_ttl_ms=stale_ttl_ms,
+                        tags=tags,
+                        cost=cost,
+                        content_type=selected.content_type,
+                    ),
+                )
+                return value
+            if _timed_out(deadline):
+                raise DogpileTimeoutError("timed out waiting for cache lease")
+            _sleep_retry(policy)
 
     def _get_keyed(
         self,
@@ -268,6 +408,7 @@ class Cachebox:
         prefix: str | None = None,
         version: str | int | None = None,
         key_func: Callable[..., Any] | None = None,
+        dogpile: DogpilePolicy | bool | None = None,
     ) -> Callable[[F], F]:
         def decorator(function: F) -> F:
             @wraps(function)
@@ -289,6 +430,7 @@ class Cachebox:
                     cost=cost,
                     serializer=serializer,
                     namespace=namespace,
+                    dogpile=dogpile,
                 )
 
             return wrapper  # type: ignore[return-value]
@@ -307,6 +449,7 @@ class Cachebox:
         namespace: str | None = None,
         prefix: str | None = None,
         version: str | int | None = None,
+        dogpile: DogpilePolicy | bool | None = None,
     ) -> Callable[[F], F]:
         def decorator(function: F) -> F:
             @wraps(function)
@@ -328,6 +471,7 @@ class Cachebox:
                     cost=cost,
                     serializer=serializer,
                     namespace=namespace,
+                    dogpile=dogpile,
                 )
 
             return wrapper  # type: ignore[return-value]
@@ -353,12 +497,14 @@ class AsyncCachebox:
         serializer: Serializer | None = None,
         key_prefix: str | None = None,
         key_version: str | int | None = None,
+        dogpile: DogpilePolicy | None = None,
     ) -> None:
         self._client = client
         self.namespace = namespace
         self.serializer = serializer or BytesSerializer()
         self.key_prefix = key_prefix
         self.key_version = key_version
+        self.dogpile = dogpile or DogpilePolicy()
 
     @classmethod
     async def connect_tcp(
@@ -369,6 +515,7 @@ class AsyncCachebox:
         serializer: Serializer | None = None,
         key_prefix: str | None = None,
         key_version: str | int | None = None,
+        dogpile: DogpilePolicy | None = None,
         pool_size: int | None = None,
         timeout: float | None = None,
         acquire_timeout: float | None = None,
@@ -389,6 +536,7 @@ class AsyncCachebox:
             serializer=serializer,
             key_prefix=key_prefix,
             key_version=key_version,
+            dogpile=dogpile,
         )
 
     async def close(self) -> None:
@@ -460,6 +608,7 @@ class AsyncCachebox:
         cost: int | None = None,
         serializer: Serializer | None = None,
         namespace: str | None = None,
+        dogpile: DogpilePolicy | bool | None = None,
     ) -> Any:
         return await self._get_or_set_keyed(
             self.key(key),
@@ -470,6 +619,7 @@ class AsyncCachebox:
             cost=cost,
             serializer=serializer,
             namespace=namespace,
+            dogpile=dogpile,
         )
 
     async def _get_or_set_keyed(
@@ -483,7 +633,22 @@ class AsyncCachebox:
         cost: int | None = None,
         serializer: Serializer | None = None,
         namespace: str | None = None,
+        dogpile: DogpilePolicy | bool | None = None,
     ) -> Any:
+        policy = _resolve_dogpile(self.dogpile, dogpile)
+        if policy.enabled:
+            return await self._get_or_set_keyed_with_lease(
+                key,
+                factory,
+                ttl_ms=ttl_ms,
+                stale_ttl_ms=stale_ttl_ms,
+                tags=tags,
+                cost=cost,
+                serializer=serializer,
+                namespace=namespace,
+                policy=policy,
+            )
+
         cached = await self._get_keyed(
             key,
             default=_MISSING,
@@ -506,6 +671,67 @@ class AsyncCachebox:
             namespace=namespace,
         )
         return value
+
+    async def _get_or_set_keyed_with_lease(
+        self,
+        key: bytes,
+        factory: Callable[[], Any] | Callable[[], Awaitable[Any]],
+        *,
+        ttl_ms: int | None = None,
+        stale_ttl_ms: int | None = None,
+        tags: Sequence[str] = (),
+        cost: int | None = None,
+        serializer: Serializer | None = None,
+        namespace: str | None = None,
+        policy: DogpilePolicy,
+    ) -> Any:
+        selected = serializer or self.serializer
+        resolved_namespace = namespace or self.namespace
+        deadline = _deadline(policy.wait_timeout_ms)
+
+        while True:
+            outcome = await self._client.start_lease(
+                resolved_namespace,
+                key,
+                policy.lease_ttl_ms,
+                policy.allow_stale_ms,
+            )
+            if isinstance(outcome, protocol.Hit):
+                return selected.decode(outcome.value)
+            if isinstance(outcome, protocol.Stale):
+                if policy.return_stale:
+                    return selected.decode(outcome.value)
+                if _timed_out(deadline):
+                    raise DogpileTimeoutError("timed out waiting for fresh cache value")
+                await _async_sleep_retry(policy)
+                continue
+            if isinstance(outcome, protocol.LeaseGranted):
+                try:
+                    value = factory()
+                    if inspect.isawaitable(value):
+                        value = await value
+                except Exception:
+                    if outcome.stale_value is not None and policy.return_stale_on_error:
+                        return selected.decode(outcome.stale_value)
+                    raise
+                encoded = selected.encode(value)
+                await self._client.complete_lease(
+                    resolved_namespace,
+                    key,
+                    outcome.lease_token,
+                    encoded,
+                    make_metadata(
+                        ttl_ms=ttl_ms,
+                        stale_ttl_ms=stale_ttl_ms,
+                        tags=tags,
+                        cost=cost,
+                        content_type=selected.content_type,
+                    ),
+                )
+                return value
+            if _timed_out(deadline):
+                raise DogpileTimeoutError("timed out waiting for cache lease")
+            await _async_sleep_retry(policy)
 
     async def _get_keyed(
         self,
@@ -558,6 +784,7 @@ class AsyncCachebox:
         prefix: str | None = None,
         version: str | int | None = None,
         key_func: Callable[..., Any] | None = None,
+        dogpile: DogpilePolicy | bool | None = None,
     ) -> Callable[[F], F]:
         def decorator(function: F) -> F:
             @wraps(function)
@@ -579,6 +806,7 @@ class AsyncCachebox:
                     cost=cost,
                     serializer=serializer,
                     namespace=namespace,
+                    dogpile=dogpile,
                 )
 
             return wrapper  # type: ignore[return-value]
@@ -597,6 +825,7 @@ class AsyncCachebox:
         namespace: str | None = None,
         prefix: str | None = None,
         version: str | int | None = None,
+        dogpile: DogpilePolicy | bool | None = None,
     ) -> Callable[[F], F]:
         def decorator(function: F) -> F:
             @wraps(function)
@@ -618,6 +847,7 @@ class AsyncCachebox:
                     cost=cost,
                     serializer=serializer,
                     namespace=namespace,
+                    dogpile=dogpile,
                 )
 
             return wrapper  # type: ignore[return-value]
@@ -654,6 +884,44 @@ def _explicit_key(
             **bound.arguments,
         )
     return build_custom_key(key, prefix=prefix, version=version)
+
+
+def _resolve_dogpile(
+    default: DogpilePolicy,
+    override: DogpilePolicy | bool | None,
+) -> DogpilePolicy:
+    if override is None:
+        return default
+    if isinstance(override, bool):
+        if override:
+            return default
+        return DogpilePolicy(enabled=False)
+    return override
+
+
+def _deadline(timeout_ms: int) -> float:
+    return time.monotonic() + (timeout_ms / 1000)
+
+
+def _timed_out(deadline: float) -> bool:
+    return time.monotonic() >= deadline
+
+
+def _retry_delay_seconds(policy: DogpilePolicy) -> float:
+    jitter_ms = (
+        random.uniform(0, policy.retry_jitter_ms)
+        if policy.retry_jitter_ms > 0
+        else 0
+    )
+    return max(0, policy.retry_interval_ms + jitter_ms) / 1000
+
+
+def _sleep_retry(policy: DogpilePolicy) -> None:
+    time.sleep(_retry_delay_seconds(policy))
+
+
+async def _async_sleep_retry(policy: DogpilePolicy) -> None:
+    await asyncio.sleep(_retry_delay_seconds(policy))
 
 
 class _Missing:
