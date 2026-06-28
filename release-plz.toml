@@ -1,11 +1,12 @@
 [workspace]
 git_release_enable = true
 git_tag_enable = true
+git_tag_name = "v{{ version }}"
 git_only = true
 pr_name = "chore: release {{ package }} {{ version }}"
 pr_labels = ["release"]
 publish = false
-release = true
+release = false
 release_always = false
 release_commits = "^(feat|fix|perf)(\\(.+\\))?!?:|^[a-z]+(\\(.+\\))?!:|^.+BREAKING CHANGE:"
 
@@ -21,3 +22,4 @@ commit_parsers = [
 [[package]]
 name = "cachebox"
 changelog_path = "CHANGELOG.md"
+release = true
