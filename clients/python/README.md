@@ -12,11 +12,23 @@ caching APIs with lease-backed dogpile protection.
 
 ## Local Development
 
+Install the package in editable mode:
+
+```sh
+uv pip install -e clients/python
+```
+
 Run the Python tests from the repository root with the local package built and
 installed into the same environment as pytest:
 
 ```sh
 uv run --with pytest --with clients/python pytest clients/python/tests
+```
+
+Run the optional gevent compatibility test:
+
+```sh
+uv run --with pytest --with gevent --with clients/python pytest clients/python/tests/test_gevent.py
 ```
 
 Build the source distribution and universal Python wheel:
@@ -67,6 +79,23 @@ value; if that refresh raises and the server supplied a stale value, the stale
 value is returned by default. Cachebox currently has no lease-abort command, so
 failed refresh leases expire according to `lease_ttl_ms`.
 
+## gevent
+
+The synchronous client uses Python socket APIs, so it can cooperate with gevent
+when applications monkey patch before opening Cachebox connections:
+
+```python
+from gevent import monkey
+
+monkey.patch_all()
+
+from cachebox import Cachebox
+```
+
+Patch before importing application modules that create clients or pools. The
+default Python package does not start a Rust or Tokio runtime, so gevent is not
+bypassed by native extension work in normal installations.
+
 Low-level clients and high-level cache APIs build on explicit serializers and
 deterministic keys:
 
@@ -81,3 +110,10 @@ key = build_function_key(load_user, 123, prefix="users", version=1)
 metadata = make_metadata(ttl_ms=60_000, tags=("users",), content_type=serializer.content_type)
 payload = serializer.encode({"id": 123, "name": "Ada"})
 ```
+
+## Release Readiness
+
+The Python package is pure Python by default. Normal wheel or source
+distribution installation does not require a Rust toolchain. Repository release
+metadata is managed by automation; do not edit generated changelog, version
+tag, or release artifact metadata manually.

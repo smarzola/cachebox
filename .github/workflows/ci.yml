@@ -92,5 +92,8 @@ jobs:
       - name: Run Python client tests
         run: uv run --with pytest --with clients/python pytest clients/python/tests
 
+      - name: Run gevent compatibility tests
+        run: uv run --with pytest --with gevent --with clients/python pytest clients/python/tests/test_gevent.py
+
       - name: Build Python client package
         run: uv build clients/python
