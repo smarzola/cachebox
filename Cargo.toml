@@ -7,7 +7,12 @@ license = "MIT"
 repository = "https://github.com/smarzola/cachebox"
 
 [workspace]
-members = [".", "crates/cachebox-protocol", "clients/rust/cachebox-client"]
+members = [
+    ".",
+    "crates/cachebox-protocol",
+    "clients/rust/cachebox-client",
+    "clients/python",
+]
 
 [dependencies]
 axum = "0.8.9"

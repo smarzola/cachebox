@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cachebox"
+version = "0.1.0"
+description = "Official Python client for Cachebox."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+
+[tool.maturin]
+module-name = "cachebox._cachebox"
+python-source = "python"
+features = ["pyo3/extension-module"]
