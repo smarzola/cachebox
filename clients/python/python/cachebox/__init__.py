@@ -13,6 +13,23 @@ from .client import (
     ServerError,
     UnexpectedResponse,
 )
+from .keys import (
+    KeyBuildError,
+    KeyOptions,
+    build_custom_key,
+    build_function_key,
+    build_template_key,
+    make_metadata,
+)
+from .serde import (
+    BytesSerializer,
+    DecodeError,
+    EncodeError,
+    JsonSerializer,
+    PickleSerializer,
+    SerializationError,
+    Serializer,
+)
 
 __version__ = "0.1.0"
 
@@ -27,4 +44,17 @@ __all__ = [
     "ConnectionClosed",
     "ServerError",
     "UnexpectedResponse",
+    "BytesSerializer",
+    "DecodeError",
+    "EncodeError",
+    "JsonSerializer",
+    "KeyBuildError",
+    "KeyOptions",
+    "PickleSerializer",
+    "SerializationError",
+    "Serializer",
+    "build_custom_key",
+    "build_function_key",
+    "build_template_key",
+    "make_metadata",
 ]

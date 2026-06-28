@@ -6,9 +6,9 @@ a native Python implementation so it can support normal Python sockets,
 distributions without requiring a Rust toolchain.
 
 The current package includes a pure Python native protocol codec, synchronous
-socket client, asyncio client, and optional sync/async connection pools.
-Decorators, serializers, and dogpile protection are implemented in follow-up
-native Python milestones.
+socket client, asyncio client, optional sync/async connection pools,
+serializer helpers, and deterministic key builders. Decorators and dogpile
+protection are implemented in follow-up native Python milestones.
 
 ## Local Development
 
@@ -41,4 +41,18 @@ async with await AsyncClient.connect_tcp("127.0.0.1:7401") as client:
 
     result = await client.get("default", b"user:456")
     assert result == protocol.Hit(b"cached bytes")
+```
+
+High-level cache APIs build on explicit serializers and deterministic keys:
+
+```python
+from cachebox import JsonSerializer, build_function_key, make_metadata
+
+def load_user(user_id: int, include_profile: bool = True):
+    ...
+
+serializer = JsonSerializer()
+key = build_function_key(load_user, 123, prefix="users", version=1)
+metadata = make_metadata(ttl_ms=60_000, tags=("users",), content_type=serializer.content_type)
+payload = serializer.encode({"id": 123, "name": "Ada"})
 ```
