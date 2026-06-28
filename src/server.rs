@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
@@ -400,37 +401,54 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let connection_id = NEXT_NATIVE_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (response_tx, mut response_rx) = mpsc::channel::<Vec<u8>>(MAX_IN_FLIGHT_PER_CONNECTION);
+    let (mut reader, writer) = tokio::io::split(stream);
+    let mut writer = Some(writer);
+    let mut response_tx = None;
+    let mut writer_task = None;
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONNECTION));
     let mut read_buffer = Vec::with_capacity(HEADER_LEN + 1024);
+    let mut response_buffer = Vec::with_capacity(HEADER_LEN + 1024);
     let mut pipelined = false;
 
-    let writer_task = tokio::spawn(async move {
-        while let Some(response) = response_rx.recv().await {
-            let response = coalesce_native_responses(response, &mut response_rx);
-            writer.write_all(&response).await?;
-        }
-        std::io::Result::Ok(())
-    });
-
-    while let Some(frames) =
-        read_native_frame_batch(&mut reader, &mut read_buffer, max_payload_len).await?
+    while let Some(frame_ranges) =
+        read_native_frame_ranges(&mut reader, &mut read_buffer, max_payload_len).await?
     {
-        if frames.len() > 1 {
+        if frame_ranges.len() > 1 {
             pipelined = true;
         }
 
         if !pipelined {
-            for frame in frames {
-                let response =
-                    execute_native_frame_bytes(&state, &frame, max_payload_len, connection_id);
-                if response_tx.send(response).await.is_err() {
-                    return Ok(());
+            for frame_range in &frame_ranges {
+                response_buffer.clear();
+                execute_native_frame_bytes_into(
+                    &state,
+                    &read_buffer[frame_range.clone()],
+                    max_payload_len,
+                    connection_id,
+                    &mut response_buffer,
+                );
+                if let Some(writer) = writer.as_mut() {
+                    writer.write_all(&response_buffer).await?;
                 }
             }
+            drain_frame_ranges(&mut read_buffer, &frame_ranges);
             continue;
         }
+
+        if response_tx.is_none() {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(MAX_IN_FLIGHT_PER_CONNECTION);
+            let writer = writer
+                .take()
+                .expect("native writer should exist before pipelined mode");
+            writer_task = Some(spawn_native_writer_task(writer, rx));
+            response_tx = Some(tx);
+        }
+
+        let frames: Vec<Vec<u8>> = frame_ranges
+            .iter()
+            .map(|range| read_buffer[range.clone()].to_vec())
+            .collect();
+        drain_frame_ranges(&mut read_buffer, &frame_ranges);
 
         for frame in frames {
             let permit = Arc::clone(&in_flight)
@@ -438,10 +456,19 @@ where
                 .await
                 .expect("connection semaphore should stay open");
             let state = state.clone();
-            let response_tx = response_tx.clone();
+            let response_tx = response_tx
+                .as_ref()
+                .expect("pipelined response channel should be initialized")
+                .clone();
             tokio::spawn(async move {
-                let response =
-                    execute_native_frame_bytes(&state, &frame, max_payload_len, connection_id);
+                let mut response = Vec::new();
+                execute_native_frame_bytes_into(
+                    &state,
+                    &frame,
+                    max_payload_len,
+                    connection_id,
+                    &mut response,
+                );
                 let _ = response_tx.send(response).await;
                 drop(permit);
             });
@@ -449,9 +476,29 @@ where
     }
 
     drop(response_tx);
-    writer_task
-        .await
-        .map_err(|error| io::Error::other(format!("native writer task failed: {error}")))?
+    if let Some(writer_task) = writer_task {
+        writer_task
+            .await
+            .map_err(|error| io::Error::other(format!("native writer task failed: {error}")))?
+    } else {
+        Ok(())
+    }
+}
+
+fn spawn_native_writer_task<W>(
+    mut writer: W,
+    mut response_rx: mpsc::Receiver<Vec<u8>>,
+) -> JoinHandle<std::io::Result<()>>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(response) = response_rx.recv().await {
+            let response = coalesce_native_responses(response, &mut response_rx);
+            writer.write_all(&response).await?;
+        }
+        std::io::Result::Ok(())
+    })
 }
 
 fn coalesce_native_responses(first: Vec<u8>, response_rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
@@ -474,16 +521,16 @@ fn coalesce_native_responses(first: Vec<u8>, response_rx: &mut mpsc::Receiver<Ve
     batch
 }
 
-async fn read_native_frame_batch<R>(
+async fn read_native_frame_ranges<R>(
     reader: &mut R,
     buffer: &mut Vec<u8>,
     max_payload_len: usize,
-) -> std::io::Result<Option<Vec<Vec<u8>>>>
+) -> std::io::Result<Option<Vec<Range<usize>>>>
 where
     R: AsyncRead + Unpin,
 {
     loop {
-        match drain_complete_native_frames(buffer, max_payload_len) {
+        match find_complete_native_frames(buffer, max_payload_len) {
             FrameDrain::Frames(frames) => return Ok(Some(frames)),
             FrameDrain::Close => return Ok(None),
             FrameDrain::NeedMore => {}
@@ -497,12 +544,12 @@ where
 }
 
 enum FrameDrain {
-    Frames(Vec<Vec<u8>>),
+    Frames(Vec<Range<usize>>),
     NeedMore,
     Close,
 }
 
-fn drain_complete_native_frames(buffer: &mut Vec<u8>, max_payload_len: usize) -> FrameDrain {
+fn find_complete_native_frames(buffer: &[u8], max_payload_len: usize) -> FrameDrain {
     let mut frames = Vec::new();
     let mut offset = 0;
     while buffer.len().saturating_sub(offset) >= HEADER_LEN {
@@ -519,13 +566,10 @@ fn drain_complete_native_frames(buffer: &mut Vec<u8>, max_payload_len: usize) ->
         if buffer.len().saturating_sub(offset) < frame_len {
             break;
         }
-        frames.push(buffer[offset..offset + frame_len].to_vec());
+        frames.push(offset..offset + frame_len);
         offset += frame_len;
     }
 
-    if offset > 0 {
-        buffer.drain(..offset);
-    }
     if frames.is_empty() {
         FrameDrain::NeedMore
     } else {
@@ -533,13 +577,19 @@ fn drain_complete_native_frames(buffer: &mut Vec<u8>, max_payload_len: usize) ->
     }
 }
 
-fn execute_native_frame_bytes(
+fn drain_frame_ranges(buffer: &mut Vec<u8>, ranges: &[Range<usize>]) {
+    if let Some(last) = ranges.last() {
+        buffer.drain(..last.end);
+    }
+}
+
+fn execute_native_frame_bytes_into(
     state: &AppState,
     frame: &[u8],
     max_payload_len: usize,
     connection_id: u64,
-) -> Vec<u8> {
-    let mut response_buffer = Vec::new();
+    response_buffer: &mut Vec<u8>,
+) {
     match decode_borrowed_request_frame(frame, max_payload_len) {
         Ok(Some(request)) => {
             let metrics = state
@@ -553,11 +603,11 @@ fn execute_native_frame_bytes(
                     request.command,
                     namespace,
                     key,
-                    &mut response_buffer,
+                    response_buffer,
                 );
             } else {
                 let response = execute_native_request_view(state, metrics, request);
-                encode_response_frame_into(&response, &mut response_buffer);
+                encode_response_frame_into(&response, response_buffer);
             }
         }
         Ok(None) => match decode_request_frame(frame, max_payload_len) {
@@ -566,21 +616,20 @@ fn execute_native_frame_bytes(
                     .metrics
                     .shard_for_request(connection_id, request.request_id);
                 let response = execute_native_request(state, metrics, request);
-                encode_response_frame_into(&response, &mut response_buffer);
+                encode_response_frame_into(&response, response_buffer);
             }
             Err(error) => {
                 if let Some(response) = native_decode_error_response(frame, error) {
-                    encode_response_frame_into(&response, &mut response_buffer);
+                    encode_response_frame_into(&response, response_buffer);
                 }
             }
         },
         Err(error) => {
             if let Some(response) = native_decode_error_response(frame, error) {
-                encode_response_frame_into(&response, &mut response_buffer);
+                encode_response_frame_into(&response, response_buffer);
             }
         }
     }
-    response_buffer
 }
 
 async fn handle_request(
@@ -1193,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_complete_native_frames_returns_all_buffered_frames() {
+    fn find_complete_native_frames_returns_all_buffered_ranges() {
         let first = encode_request_frame(&NativeRequestFrame {
             request_id: 1,
             command: Command::Get,
@@ -1212,16 +1261,19 @@ mod tests {
         });
         let mut buffer = [first.as_slice(), second.as_slice()].concat();
 
-        let FrameDrain::Frames(frames) = drain_complete_native_frames(&mut buffer, 8192) else {
+        let FrameDrain::Frames(frames) = find_complete_native_frames(&buffer, 8192) else {
             panic!("expected complete frames");
         };
 
-        assert_eq!(frames, vec![first, second]);
+        assert_eq!(frames, vec![0..first.len(), first.len()..buffer.len()]);
+        assert_eq!(&buffer[frames[0].clone()], first.as_slice());
+        assert_eq!(&buffer[frames[1].clone()], second.as_slice());
+        drain_frame_ranges(&mut buffer, &frames);
         assert!(buffer.is_empty());
     }
 
     #[test]
-    fn drain_complete_native_frames_keeps_partial_frame_buffered() {
+    fn find_complete_native_frames_keeps_partial_frame_buffered() {
         let frame = encode_request_frame(&NativeRequestFrame {
             request_id: 1,
             command: Command::Get,
@@ -1231,13 +1283,31 @@ mod tests {
             },
         });
         let split = frame.len() - 3;
-        let mut buffer = frame[..split].to_vec();
+        let buffer = frame[..split].to_vec();
 
         assert!(matches!(
-            drain_complete_native_frames(&mut buffer, 8192),
+            find_complete_native_frames(&buffer, 8192),
             FrameDrain::NeedMore
         ));
         assert_eq!(buffer, frame[..split]);
+    }
+
+    #[test]
+    fn find_complete_native_frames_closes_on_oversized_payload() {
+        let mut buffer = encode_request_frame(&NativeRequestFrame {
+            request_id: 1,
+            command: Command::Get,
+            payload: RequestPayload::Get {
+                namespace: "default".to_string(),
+                key: b"a".to_vec(),
+            },
+        });
+        buffer[16..20].copy_from_slice(&9000_u32.to_be_bytes());
+
+        assert!(matches!(
+            find_complete_native_frames(&buffer, 8192),
+            FrameDrain::Close
+        ));
     }
 
     #[tokio::test]
