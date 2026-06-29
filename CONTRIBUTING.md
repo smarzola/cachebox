@@ -56,10 +56,10 @@ The CI gate checks:
 
 Releases are automated through generated release PRs.
 
-When a normal PR with release-producing commits merges to `main`, release-plz
-opens or updates a release PR with the version and changelog changes. Merging
-that generated release PR publishes the SemVer tag, GitHub Release, release
-binaries, and GHCR image.
+When a normal PR with release-producing commits merges to `main`, the release
+workflow opens or updates a `release/vX.Y.Z` PR with version and changelog
+changes. Merging that generated release PR publishes the SemVer tag, GitHub
+Release, release binaries, and GHCR image.
 
 Documentation-only and other non-release commits do not create a release.
 Direct pushes to `main` do not run the release workflow.
