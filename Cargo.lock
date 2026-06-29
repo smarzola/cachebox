@@ -68,7 +68,7 @@ checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
 name = "cachebox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "cachebox-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cachebox-protocol",
  "serde_json",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "cachebox-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
 ]
