@@ -7,11 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0](https://github.com/smarzola/cachebox/releases/tag/cachebox-v0.1.0) - 2026-06-28
+## [0.1.0](https://github.com/smarzola/cachebox/releases/tag/v0.1.0) - 2026-06-28
 
 ### Added
 
 - add automated release workflow
-# Changelog
-
-All notable changes to Cachebox will be recorded here by release automation.
